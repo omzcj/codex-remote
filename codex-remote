@@ -1,0 +1,299 @@
+#!/bin/sh
+
+set -u
+
+PROGRAM_NAME="codex-remote"
+PROGRAM_VERSION="0.1.0"
+ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
+INSTALL_URL="https://chatgpt.com/codex/install.sh"
+CONTROL_DIR="${CODEX_HOME:-$HOME/.codex}/app-server-control"
+CONTROL_SOCKET="$CONTROL_DIR/app-server-control.sock"
+BOOTSTRAP_MARKER="$CONTROL_DIR/bootstrap-v1.done"
+CHATGPT_APP="${CODEX_REMOTE_CHATGPT_APP:-/Applications/ChatGPT.app}"
+CHATGPT_BUNDLE_ID="${CODEX_REMOTE_CHATGPT_BUNDLE_ID:-com.openai.codex}"
+CHATGPT_PATTERN="^${CHATGPT_APP}/Contents/MacOS/ChatGPT$"
+CODEX_BIN=""
+
+log() {
+  printf '%s %s\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+fail() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage: $PROGRAM_NAME [command]
+
+Manually connect ChatGPT Desktop to the Codex managed app-server daemon.
+No LaunchAgent is installed or required.
+
+Commands:
+  start       Enable daemon reuse, start the daemon, and restart ChatGPT
+              if it is currently running (default)
+  status      Show the environment, daemon, ChatGPT, and reuse status
+  restart     Restart the managed daemon and ChatGPT
+  disable     Disable daemon reuse and restart ChatGPT; keep the daemon running
+  help        Show this help
+
+Options:
+  -h, --help     Show this help
+  -v, --version  Show the installed version
+
+Environment:
+  CODEX_REMOTE_CODEX_BIN       Override the Codex CLI path
+  CODEX_REMOTE_CHATGPT_APP     Override the ChatGPT.app path
+  CODEX_REMOTE_CHATGPT_BUNDLE_ID
+                               Override the ChatGPT bundle identifier
+EOF
+}
+
+require_macos() {
+  [ "$(/usr/bin/uname -s)" = "Darwin" ] || fail "macOS is required"
+}
+
+find_codex() {
+  if [ -n "${CODEX_REMOTE_CODEX_BIN:-}" ]; then
+    CODEX_BIN="$CODEX_REMOTE_CODEX_BIN"
+  elif [ -x "$HOME/.local/bin/codex" ]; then
+    CODEX_BIN="$HOME/.local/bin/codex"
+  else
+    CODEX_BIN="$(command -v codex 2>/dev/null || true)"
+  fi
+
+  [ -n "$CODEX_BIN" ] && [ -x "$CODEX_BIN" ]
+}
+
+install_codex() {
+  log "Codex CLI not found; running the official installer"
+  installer_path="$(/usr/bin/mktemp -t codex-install)" || return 1
+
+  if ! /usr/bin/curl -fsSL "$INSTALL_URL" -o "$installer_path"; then
+    /bin/rm -f "$installer_path"
+    return 1
+  fi
+
+  if ! /bin/sh "$installer_path"; then
+    /bin/rm -f "$installer_path"
+    return 1
+  fi
+
+  /bin/rm -f "$installer_path"
+  find_codex
+}
+
+ensure_codex() {
+  find_codex && return 0
+  install_codex || fail "failed to install the Codex CLI from $INSTALL_URL"
+  [ -x "$CODEX_BIN" ] || fail "Codex CLI is unavailable after installation"
+}
+
+chatgpt_pids() {
+  /usr/bin/pgrep -f "$CHATGPT_PATTERN" 2>/dev/null || true
+}
+
+stop_chatgpt() {
+  running_pids="$(chatgpt_pids)"
+  [ -n "$running_pids" ] || return 1
+
+  log "stopping ChatGPT: $running_pids"
+  for process_id in $running_pids; do
+    /bin/kill -TERM "$process_id" 2>/dev/null || true
+  done
+
+  waited=0
+  while [ -n "$(chatgpt_pids)" ] && [ "$waited" -lt 20 ]; do
+    /bin/sleep 1
+    waited=$((waited + 1))
+  done
+
+  remaining_pids="$(chatgpt_pids)"
+  if [ -n "$remaining_pids" ]; then
+    log "forcing ChatGPT to stop: $remaining_pids"
+    for process_id in $remaining_pids; do
+      /bin/kill -KILL "$process_id" 2>/dev/null || true
+    done
+    /bin/sleep 1
+  fi
+
+  [ -z "$(chatgpt_pids)" ] || fail "ChatGPT did not stop"
+  return 0
+}
+
+restart_chatgpt_if_running() {
+  if stop_chatgpt; then
+    log "reopening ChatGPT"
+    /usr/bin/open -b "$CHATGPT_BUNDLE_ID" || fail "failed to reopen ChatGPT"
+  else
+    log "ChatGPT is not running; it will use the new setting next time it opens"
+  fi
+}
+
+bootstrap_daemon() {
+  log "bootstrapping the managed daemon"
+  /bin/mkdir -p "$CONTROL_DIR" || return 1
+  "$CODEX_BIN" app-server daemon bootstrap || return 1
+  /bin/date '+%Y-%m-%d %H:%M:%S' >"$BOOTSTRAP_MARKER" || return 1
+}
+
+daemon_ready() {
+  "$CODEX_BIN" app-server daemon version >/dev/null 2>&1
+}
+
+start_daemon() {
+  bootstrap_ran=0
+
+  if [ ! -f "$BOOTSTRAP_MARKER" ]; then
+    bootstrap_daemon || fail "daemon bootstrap failed"
+    bootstrap_ran=1
+  fi
+
+  for delay in 0 2 5; do
+    /bin/sleep "$delay"
+    log "daemon start attempt after ${delay}s"
+    if "$CODEX_BIN" app-server daemon start; then
+      return 0
+    fi
+    daemon_ready && return 0
+  done
+
+  if [ "$bootstrap_ran" -eq 0 ]; then
+    log "daemon is unavailable; attempting one bootstrap repair"
+    if bootstrap_daemon && \
+      { "$CODEX_BIN" app-server daemon start || daemon_ready; }; then
+      return 0
+    fi
+  fi
+
+  fail "managed daemon did not become ready"
+}
+
+enable_reuse() {
+  /bin/launchctl setenv "$ENV_NAME" 1 || fail "failed to set $ENV_NAME"
+}
+
+disable_reuse() {
+  /bin/launchctl unsetenv "$ENV_NAME" || fail "failed to clear $ENV_NAME"
+}
+
+desktop_reuses_daemon() {
+  app_pid="$(chatgpt_pids | /usr/bin/head -n 1)"
+  daemon_pid="$(/usr/bin/pgrep -f "${CONTROL_DIR%/app-server-control}/packages/standalone/current/codex app-server --listen unix://" 2>/dev/null | /usr/bin/head -n 1)"
+
+  [ -n "$app_pid" ] && [ -n "$daemon_pid" ] && [ -S "$CONTROL_SOCKET" ] || return 1
+  command -v lsof >/dev/null 2>&1 || return 2
+
+  for socket_id in $(/usr/sbin/lsof -n -a -p "$daemon_pid" -U 2>/dev/null | \
+    /usr/bin/awk -v socket="$CONTROL_SOCKET" '$NF == socket { print $6 }'); do
+    if /usr/sbin/lsof -n -a -p "$app_pid" -U 2>/dev/null | \
+      /usr/bin/grep -F -- "->$socket_id" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+command_start() {
+  require_macos
+  ensure_codex
+  enable_reuse
+  start_daemon
+  daemon_ready || fail "daemon status check failed after start"
+  restart_chatgpt_if_running
+  log "daemon reuse is enabled"
+}
+
+command_restart() {
+  require_macos
+  ensure_codex
+  enable_reuse
+
+  if ! "$CODEX_BIN" app-server daemon restart; then
+    log "daemon restart failed; attempting bootstrap and start"
+    bootstrap_daemon || fail "daemon bootstrap failed"
+    "$CODEX_BIN" app-server daemon start || daemon_ready || \
+      fail "managed daemon did not become ready"
+  fi
+
+  restart_chatgpt_if_running
+  log "managed daemon and ChatGPT restart completed"
+}
+
+command_disable() {
+  require_macos
+  disable_reuse
+  restart_chatgpt_if_running
+  log "daemon reuse is disabled; the managed daemon was left running"
+}
+
+command_status() {
+  require_macos
+
+  printf 'codex-remote: %s\n' "$PROGRAM_VERSION"
+  printf 'reuse environment: %s\n' "$(/bin/launchctl getenv "$ENV_NAME" 2>/dev/null || true)"
+
+  if find_codex; then
+    printf 'codex: %s\n' "$CODEX_BIN"
+    printf 'daemon: '
+    "$CODEX_BIN" app-server daemon version 2>&1 || true
+  else
+    printf 'codex: not found\n'
+    printf 'daemon: unavailable\n'
+  fi
+
+  running_pids="$(chatgpt_pids)"
+  if [ -n "$running_pids" ]; then
+    printf 'ChatGPT: running (%s)\n' "$(printf '%s' "$running_pids" | /usr/bin/tr '\n' ' ')"
+    if desktop_reuses_daemon; then
+      printf 'Desktop backend: managed daemon\n'
+    else
+      reuse_exit=$?
+      if [ "$reuse_exit" -eq 2 ]; then
+        printf 'Desktop backend: unknown (lsof unavailable)\n'
+      else
+        printf 'Desktop backend: not connected to the managed daemon\n'
+      fi
+    fi
+  else
+    printf 'ChatGPT: not running\n'
+    printf 'Desktop backend: inactive\n'
+  fi
+}
+
+main() {
+  command_name="${1:-start}"
+
+  case "$command_name" in
+    start)
+      [ "$#" -le 1 ] || fail "start does not accept arguments"
+      command_start
+      ;;
+    status)
+      [ "$#" -le 1 ] || fail "status does not accept arguments"
+      command_status
+      ;;
+    restart)
+      [ "$#" -le 1 ] || fail "restart does not accept arguments"
+      command_restart
+      ;;
+    disable)
+      [ "$#" -le 1 ] || fail "disable does not accept arguments"
+      command_disable
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    -v|--version|version)
+      printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION"
+      ;;
+    *)
+      usage >&2
+      fail "unknown command: $command_name"
+      ;;
+  esac
+}
+
+main "$@"
