@@ -8,13 +8,7 @@
 
 ## 安装
 
-源码仓库是私有仓库，安装前需要确保 GitHub SSH 可用：
-
-```sh
-ssh -T git@github.com
-```
-
-然后通过个人 Homebrew Tap 安装：
+通过个人 Homebrew Tap 安装：
 
 ```sh
 brew tap omzcj/omzcj
@@ -76,7 +70,7 @@ sh -n ./codex-remote
 版本由 `VERSION` 与脚本中的 `PROGRAM_VERSION` 共同维护。发布新版本时创建相同版本的 Git tag：
 
 ```sh
-git tag v0.1.0
+git tag v0.1.1
 git push origin main --tags
 ```
 
