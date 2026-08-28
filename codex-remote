@@ -3,12 +3,11 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="0.1.1"
+PROGRAM_VERSION="0.1.2"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
 CONTROL_DIR="${CODEX_HOME:-$HOME/.codex}/app-server-control"
 CONTROL_SOCKET="$CONTROL_DIR/app-server-control.sock"
-BOOTSTRAP_MARKER="$CONTROL_DIR/bootstrap-v1.done"
 CHATGPT_APP="${CODEX_REMOTE_CHATGPT_APP:-/Applications/ChatGPT.app}"
 CHATGPT_BUNDLE_ID="${CODEX_REMOTE_CHATGPT_BUNDLE_ID:-com.openai.codex}"
 CHATGPT_PATTERN="^${CHATGPT_APP}/Contents/MacOS/ChatGPT$"
@@ -134,8 +133,7 @@ restart_chatgpt_if_running() {
 bootstrap_daemon() {
   log "bootstrapping the managed daemon"
   /bin/mkdir -p "$CONTROL_DIR" || return 1
-  "$CODEX_BIN" app-server daemon bootstrap || return 1
-  /bin/date '+%Y-%m-%d %H:%M:%S' >"$BOOTSTRAP_MARKER" || return 1
+  "$CODEX_BIN" app-server daemon bootstrap
 }
 
 daemon_ready() {
@@ -143,13 +141,16 @@ daemon_ready() {
 }
 
 start_daemon() {
-  bootstrap_ran=0
-
-  if [ ! -f "$BOOTSTRAP_MARKER" ]; then
-    bootstrap_daemon || fail "daemon bootstrap failed"
-    bootstrap_ran=1
+  if daemon_ready; then
+    log "managed daemon is already ready"
+    return 0
   fi
 
+  if bootstrap_daemon && daemon_ready; then
+    return 0
+  fi
+
+  log "daemon bootstrap did not become ready; trying daemon start"
   for delay in 0 2 5; do
     /bin/sleep "$delay"
     log "daemon start attempt after ${delay}s"
@@ -158,14 +159,6 @@ start_daemon() {
     fi
     daemon_ready && return 0
   done
-
-  if [ "$bootstrap_ran" -eq 0 ]; then
-    log "daemon is unavailable; attempting one bootstrap repair"
-    if bootstrap_daemon && \
-      { "$CODEX_BIN" app-server daemon start || daemon_ready; }; then
-      return 0
-    fi
-  fi
 
   fail "managed daemon did not become ready"
 }
@@ -212,14 +205,12 @@ command_restart() {
   enable_reuse
 
   if ! "$CODEX_BIN" app-server daemon restart; then
-    log "daemon restart failed; attempting bootstrap and start"
-    bootstrap_daemon || fail "daemon bootstrap failed"
-    "$CODEX_BIN" app-server daemon start || daemon_ready || \
-      fail "managed daemon did not become ready"
+    log "daemon restart was rejected; checking existing daemon readiness"
+    start_daemon
   fi
 
   restart_chatgpt_if_running
-  log "managed daemon and ChatGPT restart completed"
+  log "managed daemon is ready and ChatGPT restart completed"
 }
 
 command_disable() {

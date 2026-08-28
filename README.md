@@ -14,5 +14,5 @@ codex-remote disable  # 取消 Desktop 复用
 codex-remote --help
 ```
 
-`start` 会在需要时启动 daemon，并重启正在运行的 ChatGPT。`disable` 会重启 ChatGPT，
-但不会停止 daemon，以免中断其他远程连接。
+`start` 会优先复用可响应的 daemon；仅在 daemon 不可用时执行 `bootstrap`，并重启正在
+运行的 ChatGPT。`disable` 会重启 ChatGPT，但不会停止 daemon，以免中断其他远程连接。
