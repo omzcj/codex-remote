@@ -2,24 +2,28 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v20*"
+    branches: [main]
+    paths:
+      - VERSION
+      - codex-remote
+      - "tests/**"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   release:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Validate tag and package
-        run: |
-          ./tests/test.sh
-          test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
-
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+    uses: omzcj/release-ci/.github/workflows/source-release.yml@9e6c5af26117fd344905d93a0e16be0bbf4e62c5
+    with:
+      runner: macos-15
+      project-name: codex-remote
+      validate-command: ./tests/test.sh
+      package-paths: |
+        VERSION
+        LICENSE
+        codex-remote
