@@ -3,15 +3,46 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.08.29.1"
+PROGRAM_VERSION="2026.09.06.1"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
-CONTROL_DIR="${CODEX_HOME:-$HOME/.codex}/app-server-control"
+LATEST_RELEASE_URL="https://releases.openai.com/codex/channels/latest"
+SUPPORTED_DESKTOP_VERSION="26.818.61809"
+
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+CONTROL_DIR="$CODEX_HOME_DIR/app-server-control"
 CONTROL_SOCKET="$CONTROL_DIR/app-server-control.sock"
+DAEMON_DIR="$CODEX_HOME_DIR/app-server-daemon"
+APP_SERVER_PID_FILE="$DAEMON_DIR/app-server.pid"
+UPDATER_PID_FILE="$DAEMON_DIR/app-server-updater.pid"
+
 CHATGPT_APP="${CODEX_REMOTE_CHATGPT_APP:-/Applications/ChatGPT.app}"
-CHATGPT_BUNDLE_ID="${CODEX_REMOTE_CHATGPT_BUNDLE_ID:-com.openai.codex}"
-CHATGPT_PATTERN="^${CHATGPT_APP}/Contents/MacOS/ChatGPT$"
+CHATGPT_EXECUTABLE="$CHATGPT_APP/Contents/MacOS/ChatGPT"
+PROCESS_WAIT_SECONDS="${CODEX_REMOTE_PROCESS_WAIT_SECONDS:-20}"
+UPDATER_WAIT_SECONDS="${CODEX_REMOTE_UPDATER_WAIT_SECONDS:-70}"
+ATTACH_WAIT_SECONDS="${CODEX_REMOTE_ATTACH_WAIT_SECONDS:-15}"
+
 CODEX_BIN=""
+MANAGED_CODEX_BIN=""
+CLI_VERSION=""
+MANAGED_VERSION=""
+RUNNING_VERSION=""
+SERVER_PID=""
+SERVER_COMMAND=""
+SERVER_EXECUTABLE=""
+MANAGED_PID=""
+DAEMON_BACKEND=""
+DAEMON_PROBE="unreachable"
+DAEMON_OWNERSHIP="stopped"
+UPDATER_PID=""
+UPDATER_STATE="stopped"
+REUSE_ENABLED="no"
+CHATGPT_PIDS=""
+CHATGPT_VERSION=""
+DESKTOP_COMPATIBILITY="missing"
+DESKTOP_BACKEND="inactive"
+OVERALL_STATE="disabled"
+DAEMON_VERSION_OUTPUT=""
 
 log() {
   printf '%s %s\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -26,26 +57,25 @@ usage() {
   cat <<EOF
 Usage: $PROGRAM_NAME [command]
 
-Manually connect ChatGPT Desktop to the Codex managed app-server daemon.
-No LaunchAgent is installed or required.
+Manage ChatGPT Desktop reuse of the Codex managed app-server daemon.
+Running without a command is read-only and equivalent to status.
 
 Commands:
-  start       Enable daemon reuse, start the daemon, and restart ChatGPT
-              if it is currently running (default)
-  status      Show the environment, daemon, ChatGPT, and reuse status
-  restart     Restart the managed daemon and ChatGPT
-  disable     Disable daemon reuse and restart ChatGPT; keep the daemon running
-  help        Show this help
+  status                 Show Desktop, daemon, ownership, version, and reuse state
+  enable [--force]       Enable and verify Desktop reuse of a managed daemon
+  reset                  Disable reuse and stop all related daemon processes
+  update check           Check the latest standalone Codex version
+  update latest          Install the latest standalone Codex version
+  update VERSION         Install or roll back to a specific standalone version
+  help                   Show this help
 
 Options:
-  -h, --help     Show this help
-  -v, --version  Show the installed version
+  -h, --help             Show this help
+  -v, --version          Show the installed version
 
-Environment:
-  CODEX_REMOTE_CODEX_BIN       Override the Codex CLI path
-  CODEX_REMOTE_CHATGPT_APP     Override the ChatGPT.app path
-  CODEX_REMOTE_CHATGPT_BUNDLE_ID
-                               Override the ChatGPT bundle identifier
+enable requires the official standalone Codex installation. It never installs,
+bootstraps, or updates Codex implicitly. reset interrupts clients connected to
+the shared daemon, but never deletes Codex configuration, auth, or thread data.
 EOF
 }
 
@@ -54,113 +84,369 @@ require_macos() {
 }
 
 find_codex() {
-  if [ -n "${CODEX_REMOTE_CODEX_BIN:-}" ]; then
+  CODEX_BIN=""
+  if [ -n "${CODEX_REMOTE_CODEX_BIN:-}" ] && [ -x "$CODEX_REMOTE_CODEX_BIN" ]; then
     CODEX_BIN="$CODEX_REMOTE_CODEX_BIN"
   elif [ -x "$HOME/.local/bin/codex" ]; then
     CODEX_BIN="$HOME/.local/bin/codex"
   else
     CODEX_BIN="$(command -v codex 2>/dev/null || true)"
   fi
-
   [ -n "$CODEX_BIN" ] && [ -x "$CODEX_BIN" ]
 }
 
-install_codex() {
-  log "Codex CLI not found; running the official installer"
-  installer_path="$(/usr/bin/mktemp -t codex-install)" || return 1
-
-  if ! /usr/bin/curl -fsSL "$INSTALL_URL" -o "$installer_path"; then
-    /bin/rm -f "$installer_path"
-    return 1
+find_managed_codex() {
+  MANAGED_CODEX_BIN=""
+  if [ -x "$CODEX_HOME_DIR/packages/standalone/current/bin/codex" ]; then
+    MANAGED_CODEX_BIN="$CODEX_HOME_DIR/packages/standalone/current/bin/codex"
+  elif [ -x "$CODEX_HOME_DIR/packages/standalone/current/codex" ]; then
+    MANAGED_CODEX_BIN="$CODEX_HOME_DIR/packages/standalone/current/codex"
   fi
-
-  if ! /bin/sh "$installer_path"; then
-    /bin/rm -f "$installer_path"
-    return 1
-  fi
-
-  /bin/rm -f "$installer_path"
-  find_codex
+  [ -n "$MANAGED_CODEX_BIN" ]
 }
 
-ensure_codex() {
-  find_codex && return 0
-  install_codex || fail "failed to install the Codex CLI from $INSTALL_URL"
-  [ -x "$CODEX_BIN" ] || fail "Codex CLI is unavailable after installation"
+codex_version() {
+  [ -n "${1:-}" ] && [ -x "$1" ] || return 1
+  "$1" --version 2>/dev/null | /usr/bin/sed -n 's/^codex-cli[[:space:]]*//p' | /usr/bin/head -n 1
+}
+
+json_string_field() {
+  printf '%s\n' "$1" | /usr/bin/sed -n \
+    "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | \
+    /usr/bin/head -n 1
+}
+
+pid_from_file() {
+  [ -f "$1" ] || return 1
+  /usr/bin/sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" | \
+    /usr/bin/head -n 1
+}
+
+pid_start_from_file() {
+  [ -f "$1" ] || return 1
+  /usr/bin/sed -n 's/.*"processStartTime"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | \
+    /usr/bin/head -n 1
+}
+
+pid_alive() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -gt 1 ] 2>/dev/null || return 1
+  /bin/kill -0 "$1" 2>/dev/null
+}
+
+process_uid() {
+  /bin/ps -p "$1" -o uid= 2>/dev/null | /usr/bin/tr -d '[:space:]'
+}
+
+process_command() {
+  /bin/ps -p "$1" -ww -o command= 2>/dev/null
+}
+
+process_start_time() {
+  /bin/ps -p "$1" -o lstart= 2>/dev/null | \
+    /usr/bin/sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+process_executable() {
+  /usr/sbin/lsof -a -p "$1" -d txt -Fn 2>/dev/null | \
+    /usr/bin/sed -n 's/^n//p' | /usr/bin/head -n 1
+}
+
+socket_owner_pids() {
+  [ -e "$CONTROL_SOCKET" ] || return 1
+  /usr/sbin/lsof -t "$CONTROL_SOCKET" 2>/dev/null | /usr/bin/sort -u
+}
+
+single_socket_owner_pid() {
+  owner_pids="$(socket_owner_pids || true)"
+  [ -n "$owner_pids" ] || return 1
+  [ "$(printf '%s\n' "$owner_pids" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" = "1" ] || return 1
+  printf '%s\n' "$owner_pids"
+}
+
+pid_record_is_live() {
+  pid_file="$1"
+  recorded_pid="$(pid_from_file "$pid_file" || true)"
+  recorded_start="$(pid_start_from_file "$pid_file" || true)"
+  [ -n "$recorded_pid" ] && [ -n "$recorded_start" ] || return 1
+  pid_alive "$recorded_pid" || return 1
+  [ "$(process_start_time "$recorded_pid")" = "$recorded_start" ]
 }
 
 chatgpt_pids() {
-  /usr/bin/pgrep -f "$CHATGPT_PATTERN" 2>/dev/null || true
+  /bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk -v executable="$CHATGPT_EXECUTABLE" '
+    {
+      process_id = $1
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
+      if ($0 == executable || index($0, executable " ") == 1) print process_id
+    }
+  '
 }
 
-stop_chatgpt() {
-  running_pids="$(chatgpt_pids)"
-  [ -n "$running_pids" ] || return 1
+desktop_version() {
+  info_plist="$CHATGPT_APP/Contents/Info.plist"
+  [ -f "$info_plist" ] || return 1
+  /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info_plist" 2>/dev/null
+}
 
-  log "stopping ChatGPT: $running_pids"
-  for process_id in $running_pids; do
-    /bin/kill -TERM "$process_id" 2>/dev/null || true
+desktop_reuses_daemon() {
+  [ "$DAEMON_OWNERSHIP" = "managed" ] || return 1
+  [ -n "$SERVER_PID" ] && [ -n "$CHATGPT_PIDS" ] || return 1
+  server_socket_ids="$(/usr/sbin/lsof -n -a -p "$SERVER_PID" -U 2>/dev/null | \
+    /usr/bin/awk 'NR > 1 && $6 ~ /^0x/ { print $6 }')"
+  [ -n "$server_socket_ids" ] || return 1
+  for app_pid in $CHATGPT_PIDS; do
+    app_sockets="$(/usr/sbin/lsof -n -a -p "$app_pid" -U 2>/dev/null || true)"
+    for socket_id in $server_socket_ids; do
+      if printf '%s\n' "$app_sockets" | /usr/bin/grep -F -- "->$socket_id" >/dev/null 2>&1; then
+        return 0
+      fi
+    done
   done
+  return 1
+}
 
+is_safe_updater_pid() {
+  target_pid="${1:-}"
+  expected_start="$(pid_start_from_file "$UPDATER_PID_FILE" || true)"
+  is_safe_updater_process "$target_pid" "$expected_start"
+}
+
+is_safe_updater_process() {
+  target_pid="${1:-}"
+  expected_start="${2:-}"
+  pid_alive "$target_pid" || return 1
+  [ "$(process_uid "$target_pid")" = "$(/usr/bin/id -u)" ] || return 1
+  [ -n "$expected_start" ] && [ "$(process_start_time "$target_pid")" = "$expected_start" ] || return 1
+  target_executable="$(process_executable "$target_pid")"
+  case "$target_executable" in
+    "$CODEX_HOME_DIR/packages/standalone/releases/"*/bin/codex|\
+    "$CODEX_HOME_DIR/packages/standalone/releases/"*/codex) ;;
+    *) return 1 ;;
+  esac
+  target_command="$(process_command "$target_pid")"
+  case "$target_command" in
+    *codex*" app-server daemon pid-update-loop"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+orphan_updater_pids() {
+  candidate_pids="$(/bin/ps -axo pid=,command= 2>/dev/null | /usr/bin/awk \
+    'index($0, " app-server daemon pid-update-loop") > 0 { print $1 }')"
+  for candidate_pid in $candidate_pids; do
+    candidate_start="$(process_start_time "$candidate_pid")"
+    if is_safe_updater_process "$candidate_pid" "$candidate_start"; then
+      printf '%s\n' "$candidate_pid"
+    fi
+  done
+}
+
+collect_state() {
+  CODEX_BIN=""
+  MANAGED_CODEX_BIN=""
+  CLI_VERSION=""
+  MANAGED_VERSION=""
+  RUNNING_VERSION=""
+  SERVER_PID=""
+  SERVER_COMMAND=""
+  SERVER_EXECUTABLE=""
+  MANAGED_PID=""
+  DAEMON_BACKEND=""
+  DAEMON_PROBE="unreachable"
+  DAEMON_OWNERSHIP="stopped"
+  UPDATER_PID=""
+  UPDATER_STATE="stopped"
+  CHATGPT_PIDS=""
+  CHATGPT_VERSION=""
+  DESKTOP_COMPATIBILITY="missing"
+  DESKTOP_BACKEND="inactive"
+  OVERALL_STATE="disabled"
+  DAEMON_VERSION_OUTPUT=""
+
+  reuse_value="$(/bin/launchctl getenv "$ENV_NAME" 2>/dev/null || true)"
+  if [ "$reuse_value" = "1" ]; then REUSE_ENABLED="yes"; else REUSE_ENABLED="no"; fi
+  if find_codex; then CLI_VERSION="$(codex_version "$CODEX_BIN" || true)"; fi
+  if find_managed_codex; then MANAGED_VERSION="$(codex_version "$MANAGED_CODEX_BIN" || true)"; fi
+
+  CHATGPT_VERSION="$(desktop_version || true)"
+  if [ -z "$CHATGPT_VERSION" ]; then
+    DESKTOP_COMPATIBILITY="missing"
+  elif [ "$CHATGPT_VERSION" = "$SUPPORTED_DESKTOP_VERSION" ]; then
+    DESKTOP_COMPATIBILITY="verified"
+  else
+    DESKTOP_COMPATIBILITY="unverified"
+  fi
+  CHATGPT_PIDS="$(chatgpt_pids || true)"
+
+  SERVER_PID="$(single_socket_owner_pid || true)"
+  probe_bin="$CODEX_BIN"
+  [ -n "$probe_bin" ] || probe_bin="$MANAGED_CODEX_BIN"
+  if [ -n "$probe_bin" ]; then
+    if DAEMON_VERSION_OUTPUT="$("$probe_bin" app-server daemon version 2>&1)"; then
+      DAEMON_PROBE="ready"
+      DAEMON_BACKEND="$(json_string_field "$DAEMON_VERSION_OUTPUT" backend || true)"
+      RUNNING_VERSION="$(json_string_field "$DAEMON_VERSION_OUTPUT" appServerVersion || true)"
+    fi
+  fi
+
+  if pid_record_is_live "$APP_SERVER_PID_FILE"; then
+    MANAGED_PID="$(pid_from_file "$APP_SERVER_PID_FILE")"
+  fi
+
+  if [ "$DAEMON_PROBE" = "ready" ]; then
+    if [ "$DAEMON_BACKEND" = "pid" ]; then
+      DAEMON_OWNERSHIP="managed"
+    else
+      DAEMON_OWNERSHIP="unmanaged"
+    fi
+  elif [ -n "$MANAGED_PID" ]; then
+    DAEMON_OWNERSHIP="managed-unready"
+    [ -n "$SERVER_PID" ] || SERVER_PID="$MANAGED_PID"
+  elif [ -n "$SERVER_PID" ]; then
+    DAEMON_OWNERSHIP="unmanaged"
+  elif [ -e "$CONTROL_SOCKET" ]; then
+    DAEMON_OWNERSHIP="stale-socket"
+  else
+    DAEMON_OWNERSHIP="stopped"
+  fi
+
+  if [ -n "$SERVER_PID" ] && pid_alive "$SERVER_PID"; then
+    SERVER_COMMAND="$(process_command "$SERVER_PID" || true)"
+    SERVER_EXECUTABLE="$(process_executable "$SERVER_PID" || true)"
+    if [ -z "$RUNNING_VERSION" ] && [ -x "$SERVER_EXECUTABLE" ]; then
+      RUNNING_VERSION="$(codex_version "$SERVER_EXECUTABLE" || true)"
+    fi
+  fi
+
+  UPDATER_PID="$(pid_from_file "$UPDATER_PID_FILE" || true)"
+  if [ -n "$UPDATER_PID" ] && pid_record_is_live "$UPDATER_PID_FILE"; then
+    if is_safe_updater_pid "$UPDATER_PID"; then UPDATER_STATE="running"; else UPDATER_STATE="invalid"; fi
+  elif [ -n "$UPDATER_PID" ]; then
+    UPDATER_STATE="stale"
+  else
+    orphan_updaters="$(orphan_updater_pids || true)"
+    if [ -n "$orphan_updaters" ]; then
+      UPDATER_PID="$(printf '%s\n' "$orphan_updaters" | /usr/bin/head -n 1)"
+      if [ "$(printf '%s\n' "$orphan_updaters" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" = "1" ]; then
+        UPDATER_STATE="orphan"
+      else
+        UPDATER_STATE="ambiguous"
+      fi
+    fi
+  fi
+
+  if [ -n "$CHATGPT_PIDS" ]; then
+    if desktop_reuses_daemon; then DESKTOP_BACKEND="managed-daemon"; else DESKTOP_BACKEND="not-managed-daemon"; fi
+  fi
+  classify_state
+}
+
+classify_state() {
+  case "$DAEMON_OWNERSHIP" in
+    unmanaged) OVERALL_STATE="unmanaged"; return ;;
+    stale-socket) OVERALL_STATE="stale-socket"; return ;;
+    managed-unready) OVERALL_STATE="starting-unready"; return ;;
+    managed)
+      if [ -n "$MANAGED_VERSION" ] && [ -n "$RUNNING_VERSION" ] && \
+         [ "$MANAGED_VERSION" != "$RUNNING_VERSION" ]; then
+        OVERALL_STATE="version-skew"
+        return
+      fi
+      ;;
+  esac
+  if [ "$REUSE_ENABLED" = "no" ]; then
+    OVERALL_STATE="disabled"
+  elif [ "$DAEMON_OWNERSHIP" = "stopped" ]; then
+    OVERALL_STATE="stopped"
+  elif [ -z "$CHATGPT_PIDS" ]; then
+    OVERALL_STATE="waiting-for-desktop"
+  elif [ "$DESKTOP_BACKEND" = "managed-daemon" ]; then
+    OVERALL_STATE="healthy"
+  else
+    OVERALL_STATE="not-attached"
+  fi
+  if [ "$REUSE_ENABLED" = "yes" ] && [ "$DESKTOP_COMPATIBILITY" = "unverified" ]; then
+    OVERALL_STATE="unsupported-desktop"
+  fi
+}
+
+is_safe_app_server_pid() {
+  target_pid="${1:-}"
+  expected_start="${2:-}"
+  pid_alive "$target_pid" || return 1
+  [ "$(process_uid "$target_pid")" = "$(/usr/bin/id -u)" ] || return 1
+  [ "$(process_start_time "$target_pid")" = "$expected_start" ] || return 1
+  [ "$(single_socket_owner_pid || true)" = "$target_pid" ] || return 1
+  target_executable="$(process_executable "$target_pid")"
+  case "$target_executable" in
+    "$CODEX_HOME_DIR/packages/standalone/releases/"*/bin/codex|\
+    "$CODEX_HOME_DIR/packages/standalone/releases/"*/codex) ;;
+    *) return 1 ;;
+  esac
+  target_command="$(process_command "$target_pid")"
+  case "$target_command" in
+    *codex*" app-server "*"--listen unix://"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_for_pid_exit() {
+  target_pid="$1"
+  wait_limit="${2:-$PROCESS_WAIT_SECONDS}"
   waited=0
-  while [ -n "$(chatgpt_pids)" ] && [ "$waited" -lt 20 ]; do
+  while pid_alive "$target_pid" && [ "$waited" -lt "$wait_limit" ]; do
     /bin/sleep 1
     waited=$((waited + 1))
   done
+  ! pid_alive "$target_pid"
+}
 
-  remaining_pids="$(chatgpt_pids)"
-  if [ -n "$remaining_pids" ]; then
-    log "forcing ChatGPT to stop: $remaining_pids"
-    for process_id in $remaining_pids; do
-      /bin/kill -KILL "$process_id" 2>/dev/null || true
-    done
+terminate_app_server() {
+  target_pid="$1"
+  expected_start="$(process_start_time "$target_pid")"
+  is_safe_app_server_pid "$target_pid" "$expected_start" || return 1
+  /bin/kill -TERM "$target_pid" 2>/dev/null || return 1
+  if wait_for_pid_exit "$target_pid"; then return 0; fi
+  is_safe_app_server_pid "$target_pid" "$expected_start" || return 1
+  log "forcing app-server PID $target_pid to stop"
+  /bin/kill -KILL "$target_pid" 2>/dev/null || return 1
+  wait_for_pid_exit "$target_pid"
+}
+
+terminate_updater() {
+  target_pid="$1"
+  expected_start="${2:-$(process_start_time "$target_pid")}"
+  is_safe_updater_process "$target_pid" "$expected_start" || return 1
+  /bin/kill -TERM "$target_pid" 2>/dev/null || return 1
+  wait_for_pid_exit "$target_pid" "$UPDATER_WAIT_SECONDS"
+}
+
+stop_chatgpt() {
+  allow_kill="$1"
+  running_pids="$(chatgpt_pids || true)"
+  [ -n "$running_pids" ] || return 1
+  log "stopping ChatGPT: $(printf '%s' "$running_pids" | /usr/bin/tr '\n' ' ')"
+  for process_id in $running_pids; do /bin/kill -TERM "$process_id" 2>/dev/null || true; done
+  waited=0
+  while [ -n "$(chatgpt_pids || true)" ] && [ "$waited" -lt "$PROCESS_WAIT_SECONDS" ]; do
     /bin/sleep 1
-  fi
-
-  [ -z "$(chatgpt_pids)" ] || fail "ChatGPT did not stop"
-  return 0
-}
-
-restart_chatgpt_if_running() {
-  if stop_chatgpt; then
-    log "reopening ChatGPT"
-    /usr/bin/open -b "$CHATGPT_BUNDLE_ID" || fail "failed to reopen ChatGPT"
-  else
-    log "ChatGPT is not running; it will use the new setting next time it opens"
-  fi
-}
-
-bootstrap_daemon() {
-  log "bootstrapping the managed daemon"
-  /bin/mkdir -p "$CONTROL_DIR" || return 1
-  "$CODEX_BIN" app-server daemon bootstrap
-}
-
-daemon_ready() {
-  "$CODEX_BIN" app-server daemon version >/dev/null 2>&1
-}
-
-start_daemon() {
-  if daemon_ready; then
-    log "managed daemon is already ready"
-    return 0
-  fi
-
-  if bootstrap_daemon && daemon_ready; then
-    return 0
-  fi
-
-  log "daemon bootstrap did not become ready; trying daemon start"
-  for delay in 0 2 5; do
-    /bin/sleep "$delay"
-    log "daemon start attempt after ${delay}s"
-    if "$CODEX_BIN" app-server daemon start; then
-      return 0
-    fi
-    daemon_ready && return 0
+    waited=$((waited + 1))
   done
+  remaining_pids="$(chatgpt_pids || true)"
+  [ -z "$remaining_pids" ] && return 0
+  [ "$allow_kill" = "yes" ] || return 2
+  log "forcing ChatGPT to stop: $(printf '%s' "$remaining_pids" | /usr/bin/tr '\n' ' ')"
+  for process_id in $remaining_pids; do /bin/kill -KILL "$process_id" 2>/dev/null || true; done
+  /bin/sleep 1
+  [ -z "$(chatgpt_pids || true)" ]
+}
 
-  fail "managed daemon did not become ready"
+open_chatgpt() {
+  log "opening ChatGPT"
+  /usr/bin/open "$CHATGPT_APP"
 }
 
 enable_reuse() {
@@ -171,124 +457,287 @@ disable_reuse() {
   /bin/launchctl unsetenv "$ENV_NAME" || fail "failed to clear $ENV_NAME"
 }
 
-desktop_reuses_daemon() {
-  app_pid="$(chatgpt_pids | /usr/bin/head -n 1)"
-
-  [ -n "$app_pid" ] && [ -S "$CONTROL_SOCKET" ] || return 1
-  [ -x /usr/sbin/lsof ] || return 2
-
-  daemon_pid="$(/usr/sbin/lsof -n -U 2>/dev/null | \
-    /usr/bin/awk -v socket="$CONTROL_SOCKET" \
-      '$NF == socket { print $2; exit }')"
-  [ -n "$daemon_pid" ] || return 1
-
-  for socket_id in $(/usr/sbin/lsof -n -a -p "$daemon_pid" -U 2>/dev/null | \
-    /usr/bin/awk -v socket="$CONTROL_SOCKET" '$NF == socket { print $6 }'); do
-    if /usr/sbin/lsof -n -a -p "$app_pid" -U 2>/dev/null | \
-      /usr/bin/grep -F -- "->$socket_id" >/dev/null 2>&1; then
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-command_start() {
-  require_macos
-  ensure_codex
-  enable_reuse
-  start_daemon
-  daemon_ready || fail "daemon status check failed after start"
-  restart_chatgpt_if_running
-  log "daemon reuse is enabled"
-}
-
-command_restart() {
-  require_macos
-  ensure_codex
-  enable_reuse
-
-  if ! "$CODEX_BIN" app-server daemon restart; then
-    log "daemon restart was rejected; checking existing daemon readiness"
-    start_daemon
+print_status() {
+  printf 'codex-remote: %s\n' "$PROGRAM_VERSION"
+  printf 'state: %s\n' "$OVERALL_STATE"
+  printf 'Desktop version: %s\n' "${CHATGPT_VERSION:-not installed}"
+  printf 'Desktop compatibility: %s\n' "$DESKTOP_COMPATIBILITY"
+  printf 'reuse environment: %s\n' "$REUSE_ENABLED"
+  printf 'Codex CLI: %s%s\n' "${CLI_VERSION:-not found}" "${CODEX_BIN:+ ($CODEX_BIN)}"
+  printf 'managed Codex: %s%s\n' "${MANAGED_VERSION:-not installed}" "${MANAGED_CODEX_BIN:+ ($MANAGED_CODEX_BIN)}"
+  printf 'daemon probe: %s\n' "$DAEMON_PROBE"
+  printf 'daemon backend: %s\n' "${DAEMON_BACKEND:-none}"
+  printf 'daemon ownership: %s\n' "$DAEMON_OWNERSHIP"
+  printf 'running app-server: %s\n' "${RUNNING_VERSION:-not running}"
+  printf 'socket owner: %s\n' "${SERVER_PID:-none}"
+  if [ -n "$SERVER_COMMAND" ]; then printf 'socket command: %s\n' "$SERVER_COMMAND"; fi
+  if [ -n "$SERVER_EXECUTABLE" ]; then printf 'socket executable: %s\n' "$SERVER_EXECUTABLE"; fi
+  printf 'updater: %s%s\n' "$UPDATER_STATE" "${UPDATER_PID:+ (PID $UPDATER_PID)}"
+  printf 'ChatGPT: %s\n' "$(if [ -n "$CHATGPT_PIDS" ]; then printf 'running (%s)' "$(printf '%s' "$CHATGPT_PIDS" | /usr/bin/tr '\n' ' ')"; else printf 'not running'; fi)"
+  printf 'Desktop backend: %s\n' "$DESKTOP_BACKEND"
+  if [ -n "$CLI_VERSION" ] && [ -n "$MANAGED_VERSION" ] && [ "$CLI_VERSION" != "$MANAGED_VERSION" ]; then
+    printf 'warning: CLI and managed Codex versions differ\n'
   fi
-
-  restart_chatgpt_if_running
-  log "managed daemon is ready and ChatGPT restart completed"
-}
-
-command_disable() {
-  require_macos
-  disable_reuse
-  restart_chatgpt_if_running
-  log "daemon reuse is disabled; the managed daemon was left running"
+  case "$OVERALL_STATE" in
+    unmanaged) printf 'next action: %s reset, then %s enable\n' "$PROGRAM_NAME" "$PROGRAM_NAME" ;;
+    stale-socket) printf 'next action: %s enable; official daemon start will handle the stale socket\n' "$PROGRAM_NAME" ;;
+    version-skew) printf 'next action: %s enable to restart the managed daemon\n' "$PROGRAM_NAME" ;;
+    starting-unready) printf 'next action: wait briefly, then rerun %s status; reset if unchanged\n' "$PROGRAM_NAME" ;;
+    stopped|not-attached|waiting-for-desktop) printf 'next action: %s enable\n' "$PROGRAM_NAME" ;;
+    unsupported-desktop) printf 'next action: restore Desktop %s, or use %s enable --force\n' "$SUPPORTED_DESKTOP_VERSION" "$PROGRAM_NAME" ;;
+  esac
 }
 
 command_status() {
   require_macos
+  collect_state
+  print_status
+}
 
-  printf 'codex-remote: %s\n' "$PROGRAM_VERSION"
-  printf 'reuse environment: %s\n' "$(/bin/launchctl getenv "$ENV_NAME" 2>/dev/null || true)"
+wait_for_desktop_attach() {
+  waited=0
+  while [ "$waited" -lt "$ATTACH_WAIT_SECONDS" ]; do
+    collect_state
+    [ "$DESKTOP_BACKEND" = "managed-daemon" ] && return 0
+    /bin/sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
 
-  if find_codex; then
-    printf 'codex: %s\n' "$CODEX_BIN"
-    printf 'daemon: '
-    "$CODEX_BIN" app-server daemon version 2>&1 || true
-  else
-    printf 'codex: not found\n'
-    printf 'daemon: unavailable\n'
+command_enable() {
+  allow_unverified="no"
+  if [ "${1:-}" = "--force" ]; then allow_unverified="yes"; shift; fi
+  [ "$#" -eq 0 ] || fail "enable accepts only --force"
+  require_macos
+  [ -d "$CHATGPT_APP" ] || fail "ChatGPT is not installed at $CHATGPT_APP"
+  find_managed_codex || fail "official standalone Codex is required; install it from $INSTALL_URL"
+  collect_state
+  if [ "$DESKTOP_COMPATIBILITY" = "unverified" ] && [ "$allow_unverified" != "yes" ]; then
+    fail "Desktop $CHATGPT_VERSION is unverified; restore $SUPPORTED_DESKTOP_VERSION or run enable --force"
   fi
-
-  running_pids="$(chatgpt_pids)"
-  if [ -n "$running_pids" ]; then
-    printf 'ChatGPT: running (%s)\n' "$(printf '%s' "$running_pids" | /usr/bin/tr '\n' ' ')"
-    if desktop_reuses_daemon; then
-      printf 'Desktop backend: managed daemon\n'
-    else
-      reuse_exit=$?
-      if [ "$reuse_exit" -eq 2 ]; then
-        printf 'Desktop backend: unknown (lsof unavailable)\n'
+  if [ "$OVERALL_STATE" = "healthy" ]; then
+    log "Desktop already uses the managed daemon"
+    return
+  fi
+  case "$DAEMON_OWNERSHIP" in
+    unmanaged) fail "$DAEMON_OWNERSHIP app-server detected; run $PROGRAM_NAME reset first" ;;
+    managed-unready) fail "managed daemon is not ready; wait or run $PROGRAM_NAME reset" ;;
+    stopped|stale-socket)
+      log "starting the managed daemon"
+      "$MANAGED_CODEX_BIN" app-server daemon start || fail "failed to start the managed daemon"
+      ;;
+    managed)
+      if [ -n "$MANAGED_VERSION" ] && [ -n "$RUNNING_VERSION" ] && [ "$MANAGED_VERSION" != "$RUNNING_VERSION" ]; then
+        log "restarting managed daemon $RUNNING_VERSION as $MANAGED_VERSION"
+        "$MANAGED_CODEX_BIN" app-server daemon restart || fail "failed to restart the managed daemon"
       else
-        printf 'Desktop backend: not connected to the managed daemon\n'
+        log "managed daemon is already current"
       fi
+      ;;
+  esac
+  collect_state
+  [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "daemon is not managed; run $PROGRAM_NAME reset"
+  [ -z "$MANAGED_VERSION" ] || [ "$MANAGED_VERSION" = "$RUNNING_VERSION" ] || fail "daemon version mismatch"
+  was_running="no"
+  [ -n "$CHATGPT_PIDS" ] && was_running="yes"
+  enable_reuse
+  if [ "$was_running" = "yes" ]; then
+    if ! stop_chatgpt no; then
+      disable_reuse
+      fail "ChatGPT did not exit cleanly; close it and rerun $PROGRAM_NAME enable"
     fi
+    open_chatgpt || fail "failed to reopen ChatGPT"
+    wait_for_desktop_attach || fail "ChatGPT did not connect to the managed daemon; run $PROGRAM_NAME status"
   else
-    printf 'ChatGPT: not running\n'
-    printf 'Desktop backend: inactive\n'
+    log "reuse enabled; ChatGPT will connect when it next opens"
   fi
+  log "Desktop daemon reuse is enabled"
+}
+
+stop_updater() {
+  if pid_record_is_live "$UPDATER_PID_FILE"; then
+    updater_pid="$(pid_from_file "$UPDATER_PID_FILE")"
+    is_safe_updater_pid "$updater_pid" || fail "updater PID metadata identifies an unexpected process"
+    updater_start="$(pid_start_from_file "$UPDATER_PID_FILE")"
+  else
+    updater_candidates="$(orphan_updater_pids || true)"
+    [ -n "$updater_candidates" ] || return 0
+    [ "$(printf '%s\n' "$updater_candidates" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" = "1" ] || \
+      fail "multiple orphan updater processes found"
+    updater_pid="$updater_candidates"
+    updater_start="$(process_start_time "$updater_pid")"
+  fi
+  log "stopping updater PID $updater_pid"
+  terminate_updater "$updater_pid" "$updater_start" || \
+    fail "updater did not exit safely within ${UPDATER_WAIT_SECONDS}s"
+}
+
+remove_stale_pid_file() {
+  target_file="$1"
+  [ -f "$target_file" ] || return 0
+  snapshot="$(/bin/cat "$target_file")"
+  pid_record_is_live "$target_file" && return 1
+  [ "$(/bin/cat "$target_file" 2>/dev/null || true)" = "$snapshot" ] || return 1
+  /bin/rm -f "$target_file"
+}
+
+cleanup_runtime_records() {
+  [ -z "$(socket_owner_pids || true)" ] || return 1
+  probe_bin="$CODEX_BIN"
+  [ -n "$probe_bin" ] || probe_bin="$MANAGED_CODEX_BIN"
+  if [ -n "$probe_bin" ] && "$probe_bin" app-server daemon version >/dev/null 2>&1; then return 1; fi
+  remove_stale_pid_file "$APP_SERVER_PID_FILE" || return 1
+  remove_stale_pid_file "$UPDATER_PID_FILE" || return 1
+}
+
+command_reset() {
+  [ "$#" -eq 0 ] || fail "reset does not accept arguments"
+  require_macos
+  log "reset will interrupt clients connected to the shared daemon"
+  collect_state
+  was_running="no"
+  [ -n "$CHATGPT_PIDS" ] && was_running="yes"
+  disable_reuse
+  if [ "$was_running" = "yes" ]; then stop_chatgpt yes || fail "failed to stop ChatGPT"; fi
+
+  stop_updater
+  collect_state
+  case "$DAEMON_OWNERSHIP" in
+    managed|managed-unready)
+      [ -n "$MANAGED_CODEX_BIN" ] || fail "managed Codex binary is unavailable"
+      log "stopping the managed daemon"
+      if ! stop_output="$("$MANAGED_CODEX_BIN" app-server daemon stop 2>&1)"; then
+        [ "$was_running" = "yes" ] && open_chatgpt >/dev/null 2>&1 || true
+        printf '%s\n' "$stop_output" >&2
+        fail "official daemon stop failed; no manual fallback was attempted"
+      fi
+      collect_state
+      ;;
+  esac
+  if [ -n "$SERVER_PID" ]; then
+    [ "$DAEMON_OWNERSHIP" = "unmanaged" ] || fail "daemon stop did not release its managed process"
+    log "stopping control-socket app-server PID $SERVER_PID"
+    terminate_app_server "$SERVER_PID" || fail "refusing or failing to stop app-server PID $SERVER_PID"
+  fi
+  cleanup_runtime_records || fail "runtime ownership changed; no socket or PID records were removed"
+  if [ "$was_running" = "yes" ]; then open_chatgpt || fail "shared daemon stopped, but ChatGPT could not be reopened"; fi
+  collect_state
+  case "$DAEMON_OWNERSHIP" in stopped|stale-socket) ;; *) fail "reset did not stop the shared daemon" ;; esac
+  [ "$UPDATER_STATE" = "stopped" ] || fail "reset did not fully stop the updater"
+  [ "$DESKTOP_BACKEND" != "managed-daemon" ] || fail "Desktop still uses the managed daemon"
+  log "Desktop daemon reuse is disabled and shared daemon state is reset"
+}
+
+latest_release_version() {
+  release_json="$(/usr/bin/curl -fsSL --connect-timeout 10 --max-time 30 "$LATEST_RELEASE_URL")" || return 1
+  resolved_release="$(printf '%s\n' "$release_json" | /usr/bin/sed -n \
+    's/.*"tag_name"[[:space:]]*:[[:space:]]*"rust-v\([^"]*\)".*/\1/p' | \
+    /usr/bin/head -n 1)"
+  [ -n "$resolved_release" ] || return 1
+  printf '%s\n' "$resolved_release"
+}
+
+valid_release() {
+  [ "$1" = "latest" ] && return 0
+  printf '%s\n' "$1" | /usr/bin/grep -Eq \
+    '^[0-9]+\.[0-9]+\.[0-9]+(-alpha(\.[0-9]+){0,2}|-beta(\.[0-9]+)?)?$'
+}
+
+print_update_check() {
+  latest_version="$(latest_release_version)" || fail "failed to resolve the latest Codex release"
+  collect_state
+  printf 'installed: %s\n' "${MANAGED_VERSION:-not installed}"
+  printf 'running: %s\n' "${RUNNING_VERSION:-not running}"
+  printf 'latest: %s\n' "$latest_version"
+  printf 'Desktop: %s (%s)\n' "${CHATGPT_VERSION:-not installed}" "$DESKTOP_COMPATIBILITY"
+  if [ -n "$MANAGED_VERSION" ] && [ "$MANAGED_VERSION" = "$latest_version" ]; then
+    printf 'update available: no\n'
+  else
+    printf 'update available: yes\n'
+  fi
+}
+
+install_release() {
+  release="$1"
+  installer_path="$(/usr/bin/mktemp -t codex-install)" || return 1
+  if ! /usr/bin/curl -fsSL "$INSTALL_URL" -o "$installer_path"; then
+    /bin/rm -f "$installer_path"
+    return 1
+  fi
+  /bin/sh "$installer_path" --release "$release"
+  install_exit=$?
+  /bin/rm -f "$installer_path"
+  return "$install_exit"
+}
+
+command_update() {
+  target="${1:-}"
+  [ -n "$target" ] || fail "usage: $PROGRAM_NAME update check|latest|VERSION"
+  shift
+  [ "$#" -eq 0 ] || fail "update accepts one target"
+  require_macos
+  if [ "$target" = "check" ]; then print_update_check; return; fi
+  valid_release "$target" || fail "invalid Codex release: $target"
+  find_managed_codex || fail "official standalone Codex is required; install it from $INSTALL_URL"
+  collect_state
+  case "$DAEMON_OWNERSHIP" in
+    unmanaged) fail "$DAEMON_OWNERSHIP app-server detected; run $PROGRAM_NAME reset first" ;;
+    managed-unready) fail "managed daemon is not ready; wait or run $PROGRAM_NAME reset" ;;
+  esac
+  expected_version="$target"
+  if [ "$target" = "latest" ]; then expected_version="$(latest_release_version)" || fail "failed to resolve latest release"; fi
+  daemon_was_running="no"
+  [ "$DAEMON_OWNERSHIP" = "managed" ] && daemon_was_running="yes"
+  desktop_was_running="no"
+  [ -n "$CHATGPT_PIDS" ] && desktop_was_running="yes"
+  reuse_was_enabled="$REUSE_ENABLED"
+
+  stop_updater
+  remove_stale_pid_file "$UPDATER_PID_FILE" || fail "updater PID record changed during update"
+  log "installing standalone Codex $expected_version"
+  install_release "$expected_version" || fail "official standalone installer failed"
+  find_managed_codex || fail "managed Codex is unavailable after installation"
+  installed_version="$(codex_version "$MANAGED_CODEX_BIN" || true)"
+  [ "$installed_version" = "$expected_version" ] || fail "installer selected $installed_version instead of $expected_version"
+
+  if [ "$daemon_was_running" = "yes" ]; then
+    if [ "$desktop_was_running" = "yes" ] && [ "$reuse_was_enabled" = "yes" ]; then
+      stop_chatgpt no || fail "Codex updated, but ChatGPT did not exit cleanly"
+    fi
+    log "restarting the managed daemon with Codex $installed_version"
+    if ! "$MANAGED_CODEX_BIN" app-server daemon restart; then
+      if [ "$desktop_was_running" = "yes" ] && [ "$reuse_was_enabled" = "yes" ]; then
+        open_chatgpt >/dev/null 2>&1 || true
+      fi
+      fail "Codex updated, but daemon restart failed"
+    fi
+    if [ "$desktop_was_running" = "yes" ] && [ "$reuse_was_enabled" = "yes" ]; then
+      open_chatgpt || fail "Codex updated, but ChatGPT could not be reopened"
+    fi
+  fi
+  collect_state
+  if [ "$daemon_was_running" = "yes" ]; then
+    [ "$DAEMON_OWNERSHIP" = "managed" ] && [ "$RUNNING_VERSION" = "$installed_version" ] || \
+      fail "update installed, but daemon did not converge to $installed_version"
+  fi
+  log "standalone Codex is $installed_version"
 }
 
 main() {
-  command_name="${1:-start}"
-
+  command_name="${1:-status}"
+  if [ "$#" -gt 0 ]; then shift; fi
   case "$command_name" in
-    start)
-      [ "$#" -le 1 ] || fail "start does not accept arguments"
-      command_start
-      ;;
-    status)
-      [ "$#" -le 1 ] || fail "status does not accept arguments"
-      command_status
-      ;;
-    restart)
-      [ "$#" -le 1 ] || fail "restart does not accept arguments"
-      command_restart
-      ;;
-    disable)
-      [ "$#" -le 1 ] || fail "disable does not accept arguments"
-      command_disable
-      ;;
-    help|-h|--help)
-      usage
-      ;;
-    -v|--version|version)
-      printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION"
-      ;;
-    *)
-      usage >&2
-      fail "unknown command: $command_name"
-      ;;
+    status) [ "$#" -eq 0 ] || fail "status does not accept arguments"; command_status ;;
+    enable) command_enable "$@" ;;
+    reset) command_reset "$@" ;;
+    update) command_update "$@" ;;
+    help|-h|--help) [ "$#" -eq 0 ] || fail "help does not accept arguments"; usage ;;
+    -v|--version|version) [ "$#" -eq 0 ] || fail "version does not accept arguments"; printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION" ;;
+    *) usage >&2; fail "unknown command: $command_name" ;;
   esac
 }
 
-main "$@"
+if [ "${CODEX_REMOTE_SOURCE_ONLY:-0}" != "1" ]; then
+  main "$@"
+fi
