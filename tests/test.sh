@@ -58,6 +58,47 @@ assert_classification managed no 42 not-managed-daemon verified 0.153.4 0.153.4 
 assert_classification stopped yes "" inactive verified 0.153.4 "" stopped
 assert_classification managed yes 42 managed-daemon unverified 0.153.4 0.153.4 unsupported-desktop
 
+# status must report every independent problem and compose an ordered recovery plan.
+combined_status_output="$( (
+  CHATGPT_APP=/Applications/ChatGPT.app
+  CHATGPT_VERSION=26.901.51231
+  DESKTOP_COMPATIBILITY=unverified
+  MANAGED_VERSION=0.153.4
+  RUNNING_VERSION=0.153.4
+  CLI_VERSION=0.153.4
+  DAEMON_OWNERSHIP=unmanaged
+  UPDATER_STATE=stopped
+  REUSE_ENABLED=no
+  CHATGPT_PIDS=""
+  DESKTOP_BACKEND=inactive
+  print_issues_and_recovery
+) )"
+printf '%s\n' "$combined_status_output" | grep -F "ChatGPT Desktop 26.901.51231 is unverified" >/dev/null
+printf '%s\n' "$combined_status_output" | grep -F "an unmanaged app-server owns the control socket" >/dev/null
+printf '%s\n' "$combined_status_output" | grep -F "Desktop daemon reuse is disabled" >/dev/null
+printf '%s\n' "$combined_status_output" | grep -F "ChatGPT Desktop is not running" >/dev/null
+printf '%s\n' "$combined_status_output" | grep -F "1. brew reinstall --cask omzcj/omzcj/chatgpt" >/dev/null
+printf '%s\n' "$combined_status_output" | grep -F "2. codex-remote reset" >/dev/null
+printf '%s\n' "$combined_status_output" | grep -F "3. codex-remote enable" >/dev/null
+printf '%s\n' "$combined_status_output" | grep -F "4. open /Applications/ChatGPT.app" >/dev/null
+printf '%s\n' "$combined_status_output" | grep -F "5. codex-remote status" >/dev/null
+
+# A healthy state must not invent recovery work.
+healthy_status_output="$( (
+  DESKTOP_COMPATIBILITY=verified
+  MANAGED_VERSION=0.153.4
+  RUNNING_VERSION=0.153.4
+  CLI_VERSION=0.153.4
+  DAEMON_OWNERSHIP=managed
+  UPDATER_STATE=stopped
+  REUSE_ENABLED=yes
+  CHATGPT_PIDS=42
+  DESKTOP_BACKEND=managed-daemon
+  print_issues_and_recovery
+) )"
+printf '%s\n' "$healthy_status_output" | grep -F -- "- none" >/dev/null
+printf '%s\n' "$healthy_status_output" | grep -F "recommended recovery: none" >/dev/null
+
 # enable must refuse an unmanaged app-server instead of guessing at lifecycle actions.
 set +e
 enable_error="$( (
