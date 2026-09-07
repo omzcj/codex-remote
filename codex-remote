@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.07.4"
+PROGRAM_VERSION="2026.09.07.5"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
 LATEST_RELEASE_URL="https://releases.openai.com/codex/channels/latest"
@@ -139,10 +139,8 @@ Running without a command is read-only and equivalent to status.
 Commands:
   status                 Show all detected issues and an ordered recovery plan
   start [--force]        Repair safe runtime issues, open Desktop, and verify reuse
-  stop                   Stop Desktop and reset the shared daemon runtime
+  stop                   Stop Desktop and the shared daemon runtime
   restart [--force]      Stop everything, then start and verify it again
-  enable [--force]       Enable and verify Desktop reuse of a managed daemon
-  reset                  Disable reuse and stop all related daemon processes
   update check           Check the latest standalone Codex version
   update latest          Install the latest standalone Codex version
   update VERSION         Install or roll back to a specific standalone version
@@ -152,10 +150,10 @@ Options:
   -h, --help             Show this help
   -v, --version          Show the installed version
 
-start and enable require the official standalone Codex installation. They never
-install, bootstrap, or update Codex implicitly. stop, restart, and reset interrupt
-clients connected to the shared daemon, but never delete Codex configuration,
-auth, or thread data.
+start requires the official standalone Codex installation. It never installs,
+bootstraps, or updates Codex implicitly. stop and restart interrupt clients
+connected to the shared daemon, but never delete Codex configuration, auth, or
+thread data.
 EOF
 }
 
@@ -871,25 +869,25 @@ command_start() {
     return
   fi
 
-  needs_reset=no
+  needs_stop=no
   case "$DAEMON_OWNERSHIP" in
-    unmanaged|managed-unready|stale-socket) needs_reset=yes ;;
+    unmanaged|managed-unready|stale-socket) needs_stop=yes ;;
   esac
   case "$UPDATER_STATE" in
-    running|stale|orphan) needs_reset=yes ;;
+    running|stale|orphan) needs_stop=yes ;;
   esac
-  if [ "$needs_reset" = "yes" ]; then
+  if [ "$needs_stop" = "yes" ]; then
     log "repairing shared daemon runtime before start"
-    command_reset
+    command_stop
     # Quitting Desktop can apply a previously downloaded app update. Re-run all
     # non-destructive blockers before enabling or reopening the possibly changed app.
     start_preflight "$allow_unverified" || return 1
   fi
 
   if [ "$allow_unverified" = "yes" ]; then
-    command_enable --force
+    start_managed_reuse yes
   else
-    command_enable
+    start_managed_reuse no
   fi
   collect_state
   [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "start verification failed; run $PROGRAM_NAME status"
@@ -898,24 +896,22 @@ command_start() {
   log "$PROGRAM_NAME start: healthy"
 }
 
-command_enable() {
-  allow_unverified="no"
-  if [ "${1:-}" = "--force" ]; then allow_unverified="yes"; shift; fi
-  [ "$#" -eq 0 ] || fail "enable accepts only --force"
+start_managed_reuse() {
+  allow_unverified="$1"
   require_macos
   [ -d "$CHATGPT_APP" ] || fail "ChatGPT is not installed at $CHATGPT_APP"
   find_managed_codex || fail "official standalone Codex is required; install it from $INSTALL_URL"
   collect_state
   if [ "$DESKTOP_COMPATIBILITY" = "unverified" ] && [ "$allow_unverified" != "yes" ]; then
-    fail "Desktop $CHATGPT_VERSION is unverified; restore $SUPPORTED_DESKTOP_VERSION or run enable --force"
+    fail "Desktop $CHATGPT_VERSION is unverified; restore $SUPPORTED_DESKTOP_VERSION or run $PROGRAM_NAME start --force"
   fi
   if [ "$OVERALL_STATE" = "healthy" ]; then
     log "Desktop already uses the managed daemon"
     return
   fi
   case "$DAEMON_OWNERSHIP" in
-    unmanaged) fail "$DAEMON_OWNERSHIP app-server detected; run $PROGRAM_NAME reset first" ;;
-    managed-unready) fail "managed daemon is not ready; wait or run $PROGRAM_NAME reset" ;;
+    unmanaged) fail "$DAEMON_OWNERSHIP app-server detected; run $PROGRAM_NAME stop, then $PROGRAM_NAME start" ;;
+    managed-unready) fail "managed daemon is not ready; run $PROGRAM_NAME stop, then $PROGRAM_NAME start" ;;
     stopped|stale-socket)
       log "starting the managed daemon"
       "$MANAGED_CODEX_BIN" app-server daemon start || fail "failed to start the managed daemon"
@@ -930,7 +926,7 @@ command_enable() {
       ;;
   esac
   collect_state
-  [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "daemon is not managed; run $PROGRAM_NAME reset"
+  [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "daemon is not managed; run $PROGRAM_NAME stop, then $PROGRAM_NAME start"
   [ -z "$MANAGED_VERSION" ] || [ "$MANAGED_VERSION" = "$RUNNING_VERSION" ] || fail "daemon version mismatch"
   was_running="no"
   [ -n "$CHATGPT_PIDS" ] && was_running="yes"
@@ -938,7 +934,7 @@ command_enable() {
   if [ "$was_running" = "yes" ]; then
     if ! stop_chatgpt no; then
       disable_reuse
-      fail "ChatGPT did not exit cleanly; close it and rerun $PROGRAM_NAME enable"
+      fail "ChatGPT did not exit cleanly; close it and rerun $PROGRAM_NAME start"
     fi
   fi
   open_chatgpt || fail "failed to open ChatGPT"
@@ -982,10 +978,10 @@ cleanup_runtime_records() {
   remove_stale_pid_file "$UPDATER_PID_FILE" || return 1
 }
 
-command_reset() {
-  [ "$#" -eq 0 ] || fail "reset does not accept arguments"
+command_stop() {
+  [ "$#" -eq 0 ] || fail "stop does not accept arguments"
   require_macos
-  log "reset will interrupt clients connected to the shared daemon"
+  log "stop will interrupt clients connected to the shared daemon"
   collect_state
   was_running="no"
   [ -n "$CHATGPT_PIDS" ] && was_running="yes"
@@ -1013,15 +1009,10 @@ command_reset() {
   fi
   cleanup_runtime_records || fail "runtime ownership changed; no socket or PID records were removed"
   collect_state
-  case "$DAEMON_OWNERSHIP" in stopped|stale-socket) ;; *) fail "reset did not stop the shared daemon" ;; esac
-  [ "$UPDATER_STATE" = "stopped" ] || fail "reset did not fully stop the updater"
+  case "$DAEMON_OWNERSHIP" in stopped|stale-socket) ;; *) fail "stop did not stop the shared daemon" ;; esac
+  [ "$UPDATER_STATE" = "stopped" ] || fail "stop did not fully stop the updater"
   [ "$DESKTOP_BACKEND" != "managed-daemon" ] || fail "Desktop still uses the managed daemon"
-  log "Desktop daemon reuse is disabled, shared daemon state is reset, and ChatGPT is stopped"
-}
-
-command_stop() {
-  [ "$#" -eq 0 ] || fail "stop does not accept arguments"
-  command_reset
+  log "Desktop daemon reuse is disabled, shared daemon state is clean, and ChatGPT is stopped"
 }
 
 command_restart() {
@@ -1032,7 +1023,7 @@ command_restart() {
   # Preflight before interrupting a healthy session. Installation, compatibility,
   # or unknown-process blockers must be resolved before restart tears anything down.
   start_preflight "$allow_unverified" || return 1
-  command_reset
+  command_stop
   if [ "$allow_unverified" = "yes" ]; then
     command_start --force
   else
@@ -1093,8 +1084,8 @@ command_update() {
   find_managed_codex || fail "official standalone Codex is required; install it from $INSTALL_URL"
   collect_state
   case "$DAEMON_OWNERSHIP" in
-    unmanaged) fail "$DAEMON_OWNERSHIP app-server detected; run $PROGRAM_NAME reset first" ;;
-    managed-unready) fail "managed daemon is not ready; wait or run $PROGRAM_NAME reset" ;;
+    unmanaged) fail "$DAEMON_OWNERSHIP app-server detected; run $PROGRAM_NAME stop first" ;;
+    managed-unready) fail "managed daemon is not ready; run $PROGRAM_NAME stop first" ;;
   esac
   expected_version="$target"
   if [ "$target" = "latest" ]; then expected_version="$(latest_release_version)" || fail "failed to resolve latest release"; fi
@@ -1143,8 +1134,6 @@ main() {
     start) command_start "$@" ;;
     stop) command_stop "$@" ;;
     restart) command_restart "$@" ;;
-    enable) command_enable "$@" ;;
-    reset) command_reset "$@" ;;
     update) command_update "$@" ;;
     help|-h|--help) [ "$#" -eq 0 ] || fail "help does not accept arguments"; usage ;;
     -v|--version|version) [ "$#" -eq 0 ] || fail "version does not accept arguments"; printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION" ;;

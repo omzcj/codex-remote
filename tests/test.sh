@@ -12,10 +12,19 @@ actual_version="$(./codex-remote --version)"
 [ "$actual_version" = "codex-remote $expected_version" ]
 
 help_output="$(./codex-remote --help)"
-for command_name in status start stop restart enable reset update; do
+for command_name in status start stop restart update; do
   printf '%s\n' "$help_output" | grep -F "$command_name" >/dev/null
 done
 printf '%s\n' "$help_output" | grep -F "Running without a command is read-only" >/dev/null
+if printf '%s\n' "$help_output" | grep -E '^[[:space:]]+(enable|reset)' >/dev/null; then exit 1; fi
+for removed_command in enable reset; do
+  set +e
+  removed_output="$(./codex-remote "$removed_command" 2>&1)"
+  removed_status=$?
+  set -e
+  [ "$removed_status" -ne 0 ]
+  printf '%s\n' "$removed_output" | grep -F "unknown command: $removed_command" >/dev/null
+done
 
 # Source the implementation without dispatching a real command.
 CODEX_REMOTE_SOURCE_ONLY=1
@@ -153,9 +162,9 @@ healthy_status_output="$( (
 printf '%s\n' "$healthy_status_output" | grep -F -- "- none" >/dev/null
 printf '%s\n' "$healthy_status_output" | grep -F "recommended recovery: none" >/dev/null
 
-# enable must refuse an unmanaged app-server instead of guessing at lifecycle actions.
+# The internal attach stage must refuse an unmanaged app-server instead of guessing.
 set +e
-enable_error="$( (
+attach_error="$( (
   require_macos() { :; }
   find_managed_codex() { MANAGED_CODEX_BIN=/usr/bin/true; return 0; }
   collect_state() {
@@ -163,12 +172,12 @@ enable_error="$( (
     DAEMON_OWNERSHIP=unmanaged
   }
   CHATGPT_APP=/tmp
-  command_enable
+  start_managed_reuse no
 ) 2>&1)"
-enable_status=$?
+attach_status=$?
 set -e
-[ "$enable_status" -ne 0 ]
-printf '%s\n' "$enable_error" | grep -F "run codex-remote reset first" >/dev/null
+[ "$attach_status" -ne 0 ]
+printf '%s\n' "$attach_error" | grep -F "run codex-remote stop, then codex-remote start" >/dev/null
 
 # A successful daemon start is insufficient if the follow-up probe has no pid backend.
 set +e
@@ -183,14 +192,14 @@ missing_backend_error="$( (
     if [ "$collect_count" -eq 1 ]; then DAEMON_OWNERSHIP=stopped; else DAEMON_OWNERSHIP=unmanaged; fi
   }
   CHATGPT_APP=/tmp
-  command_enable
+  start_managed_reuse no
 ) 2>&1)"
 missing_backend_status=$?
 set -e
 [ "$missing_backend_status" -ne 0 ]
 printf '%s\n' "$missing_backend_error" | grep -F "daemon is not managed" >/dev/null
 
-# A healthy enable is idempotent and must not restart either process.
+# A healthy internal attach is idempotent and must not restart either process.
 (
   require_macos() { :; }
   find_managed_codex() { MANAGED_CODEX_BIN=/usr/bin/true; return 0; }
@@ -202,10 +211,10 @@ printf '%s\n' "$missing_backend_error" | grep -F "daemon is not managed" >/dev/n
   enable_reuse() { exit 1; }
   stop_chatgpt() { exit 1; }
   CHATGPT_APP=/tmp
-  command_enable
+  start_managed_reuse no
 )
 
-# start is also idempotent: a healthy session is not reset or re-enabled.
+# start is also idempotent: a healthy session is not stopped or reattached.
 (
   require_macos() { :; }
   collect_state() {
@@ -216,8 +225,8 @@ printf '%s\n' "$missing_backend_error" | grep -F "daemon is not managed" >/dev/n
     UPDATER_STATE=stopped
     OVERALL_STATE=healthy
   }
-  command_reset() { exit 1; }
-  command_enable() { exit 1; }
+  command_stop() { exit 1; }
+  start_managed_reuse() { exit 1; }
   command_start
 )
 
@@ -248,13 +257,13 @@ printf '%s\n' "$missing_backend_error" | grep -F "daemon is not managed" >/dev/n
   socket_owner_pids() { printf '42\n'; }
   process_start_time() { printf 'Sat Sep  6 12:00:00 2026\n'; }
   is_safe_app_server_pid() { [ "$1" = 42 ]; }
-  command_reset() { order="${order}reset "; }
-  command_enable() { order="${order}enable "; }
+  command_stop() { order="${order}stop "; }
+  start_managed_reuse() { order="${order}attach "; }
   command_start
-  [ "$order" = "reset enable " ]
+  [ "$order" = "stop attach " ]
 )
 
-# Quitting Desktop can apply a staged update, so start must preflight again after reset.
+# Quitting Desktop can apply a staged update, so start must preflight again after stop.
 set +e
 post_reset_update_output="$( (
   collect_count=0
@@ -282,8 +291,8 @@ post_reset_update_output="$( (
   socket_owner_pids() { printf '42\n'; }
   process_start_time() { printf 'Sat Sep  6 12:00:00 2026\n'; }
   is_safe_app_server_pid() { return 0; }
-  command_reset() { :; }
-  command_enable() { exit 99; }
+  command_stop() { :; }
+  start_managed_reuse() { exit 99; }
   command_start
 ) 2>&1)"
 post_reset_update_status=$?
@@ -375,7 +384,7 @@ unknown_owner_output="$( (
   socket_owner_pids() { printf '42\n'; }
   process_start_time() { printf 'Sat Sep  6 12:00:00 2026\n'; }
   is_safe_app_server_pid() { return 1; }
-  command_reset() { exit 1; }
+  command_stop() { exit 1; }
   command_start
 ) 2>&1)"
 unknown_owner_status=$?
@@ -398,7 +407,7 @@ unknown_updater_output="$( (
     UPDATER_STATE=ambiguous
     UPDATER_PID=73
   }
-  command_reset() { exit 1; }
+  command_stop() { exit 1; }
   command_start
 ) 2>&1)"
 unknown_updater_status=$?
@@ -408,22 +417,14 @@ printf '%s\n' "$unknown_updater_output" | grep -F "standalone updater state is a
 printf '%s\n' "$unknown_updater_output" | grep -F "ps -p 73 -o pid=,uid=,lstart=,command=" >/dev/null
 printf '%s\n' "$unknown_updater_output" | grep -F "no process was terminated" >/dev/null
 
-# stop is the user-facing alias for a full reset.
-(
-  called=""
-  command_reset() { called=reset; }
-  command_stop
-  [ "$called" = reset ]
-)
-
-# restart preflights first, then deliberately performs a full reset/start cycle.
+# restart preflights first, then deliberately performs a full stop/start cycle.
 (
   order=""
   start_preflight() { order="${order}preflight "; }
-  command_reset() { order="${order}reset "; }
+  command_stop() { order="${order}stop "; }
   command_start() { order="${order}start:$* "; }
   command_restart --force
-  [ "$order" = "preflight reset start:--force " ]
+  [ "$order" = "preflight stop start:--force " ]
 )
 
 # A restart blocker is reported before anything is stopped.
@@ -439,7 +440,7 @@ restart_blocked_output="$( (
     DAEMON_OWNERSHIP=managed
     UPDATER_STATE=stopped
   }
-  command_reset() { exit 99; }
+  command_stop() { exit 99; }
   command_restart
 ) 2>&1)"
 restart_blocked_status=$?
@@ -447,7 +448,7 @@ set -e
 [ "$restart_blocked_status" -eq 1 ]
 printf '%s\n' "$restart_blocked_output" | grep -F "codex-remote start: blocked" >/dev/null
 
-# enable must open and verify Desktop even when it was initially stopped.
+# The internal attach stage must open and verify Desktop when it was initially stopped.
 (
   order=""
   require_macos() { :; }
@@ -464,7 +465,7 @@ printf '%s\n' "$restart_blocked_output" | grep -F "codex-remote start: blocked" 
   open_chatgpt() { order="${order}open "; }
   wait_for_desktop_attach() { order="${order}verify "; }
   CHATGPT_APP=/tmp
-  command_enable
+  start_managed_reuse no
   [ "$order" = "reuse open verify " ]
 )
 
@@ -480,7 +481,7 @@ update_error="$( (
 update_status=$?
 set -e
 [ "$update_status" -ne 0 ]
-printf '%s\n' "$update_error" | grep -F "run codex-remote reset first" >/dev/null
+printf '%s\n' "$update_error" | grep -F "run codex-remote stop first" >/dev/null
 
 # latest is resolved once and the installer receives the exact version.
 (
@@ -523,7 +524,7 @@ printf '%s\n' "$update_error" | grep -F "run codex-remote reset first" >/dev/nul
   if is_safe_app_server_pid 42 'Sat Sep  6 12:00:00 2026'; then exit 1; fi
 )
 
-# reset must stop the updater before considering app-server cleanup.
+# stop must stop the updater before considering app-server cleanup.
 (
   order=""
   require_macos() { :; }
@@ -537,11 +538,11 @@ printf '%s\n' "$update_error" | grep -F "run codex-remote reset first" >/dev/nul
   disable_reuse() { order="${order}disable "; }
   stop_updater() { order="${order}updater "; }
   cleanup_runtime_records() { order="${order}cleanup "; }
-  command_reset
+  command_stop
   [ "$order" = "disable updater cleanup " ]
 )
 
-# A successful reset leaves Desktop stopped so enable cannot race a new direct server.
+# A successful stop leaves Desktop stopped so start cannot race a new direct server.
 (
   collect_count=0
   require_macos() { :; }
@@ -558,7 +559,7 @@ printf '%s\n' "$update_error" | grep -F "run codex-remote reset first" >/dev/nul
   stop_updater() { :; }
   cleanup_runtime_records() { :; }
   open_chatgpt() { exit 1; }
-  command_reset
+  command_stop
 )
 
 # A valid but unready managed PID must still be stopped through the official lifecycle.
@@ -582,7 +583,7 @@ printf '%s\n' "$update_error" | grep -F "run codex-remote reset first" >/dev/nul
   disable_reuse() { :; }
   stop_updater() { :; }
   cleanup_runtime_records() { :; }
-  command_reset
+  command_stop
 )
 
 # A stale socket has no live process and must not block a standalone-only update.
