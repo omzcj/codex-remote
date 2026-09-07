@@ -57,7 +57,8 @@ socket/updater 进程不会被静默修改。`start` 会汇总所有 blocker，�
 `stop` 是 `reset` 的日常名称，会完全关闭 Desktop、GUI reuse 环境和 shared daemon。
 `restart` 总是执行完整的 stop/start，但会先运行 start preflight；如果恢复所需的安装或
 进程身份存在 blocker，它不会先中断当前会话。`restart --force` 与 `start --force` 使用
-相同的 Desktop 版本例外。
+相同的 Desktop 版本例外。`start` 在自动 reset 后还会再次 preflight，因为 ChatGPT 可能
+在退出时应用之前已经下载的更新，导致磁盘上的 Desktop 版本在同一次操作中发生变化。
 
 `enable` 和 `reset` 保留为底层生命周期/故障排查命令。`enable` 只接受官方 standalone
 managed binary；发现 unmanaged app-server 时会要求先 `reset`。

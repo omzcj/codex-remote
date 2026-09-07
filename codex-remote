@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.07.3"
+PROGRAM_VERSION="2026.09.07.4"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
 LATEST_RELEASE_URL="https://releases.openai.com/codex/channels/latest"
@@ -881,6 +881,9 @@ command_start() {
   if [ "$needs_reset" = "yes" ]; then
     log "repairing shared daemon runtime before start"
     command_reset
+    # Quitting Desktop can apply a previously downloaded app update. Re-run all
+    # non-destructive blockers before enabling or reopening the possibly changed app.
+    start_preflight "$allow_unverified" || return 1
   fi
 
   if [ "$allow_unverified" = "yes" ]; then

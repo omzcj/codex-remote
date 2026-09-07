@@ -254,6 +254,44 @@ printf '%s\n' "$missing_backend_error" | grep -F "daemon is not managed" >/dev/n
   [ "$order" = "reset enable " ]
 )
 
+# Quitting Desktop can apply a staged update, so start must preflight again after reset.
+set +e
+post_reset_update_output="$( (
+  collect_count=0
+  require_macos() { :; }
+  brew_available() { return 0; }
+  collect_state() {
+    collect_count=$((collect_count + 1))
+    MANAGED_VERSION=0.153.4
+    CLI_VERSION=0.153.4
+    UPDATER_STATE=stopped
+    if [ "$collect_count" -eq 1 ]; then
+      CHATGPT_VERSION=26.818.61809
+      DESKTOP_COMPATIBILITY=verified
+      DAEMON_OWNERSHIP=unmanaged
+      SERVER_PID=42
+      OVERALL_STATE=unmanaged
+    else
+      CHATGPT_VERSION=26.901.51231
+      DESKTOP_COMPATIBILITY=unverified
+      DAEMON_OWNERSHIP=stopped
+      SERVER_PID=""
+      OVERALL_STATE=stopped
+    fi
+  }
+  socket_owner_pids() { printf '42\n'; }
+  process_start_time() { printf 'Sat Sep  6 12:00:00 2026\n'; }
+  is_safe_app_server_pid() { return 0; }
+  command_reset() { :; }
+  command_enable() { exit 99; }
+  command_start
+) 2>&1)"
+post_reset_update_status=$?
+set -e
+[ "$post_reset_update_status" -eq 1 ]
+printf '%s\n' "$post_reset_update_output" | grep -F "ChatGPT Desktop 26.901.51231 is unverified" >/dev/null
+printf '%s\n' "$post_reset_update_output" | grep -F "brew reinstall --cask omzcj/omzcj/chatgpt" >/dev/null
+
 # Installation and compatibility blockers are aggregated with copyable actions.
 set +e
 start_blocked_output="$( (
