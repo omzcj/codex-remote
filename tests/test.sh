@@ -62,7 +62,10 @@ export CODEX_REMOTE_SOURCE_ONLY
 )
 
 # Subsequent command tests isolate lifecycle behavior from the real preferences.
-disable_desktop_auto_updates() { AUTO_UPDATE_CHANGED=no; }
+disable_desktop_auto_updates() {
+  AUTO_UPDATE_CHANGED=no
+  DESKTOP_AUTO_UPDATES=disabled
+}
 
 # Reuse settings must target the GUI bootstrap domain even when invoked by SSH.
 (

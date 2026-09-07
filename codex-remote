@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.07.5"
+PROGRAM_VERSION="2026.09.07.6"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
 LATEST_RELEASE_URL="https://releases.openai.com/codex/channels/latest"
@@ -305,6 +305,18 @@ disable_desktop_auto_updates() {
   if [ "$AUTO_UPDATE_CHANGED" = "yes" ]; then
     log "disabled ChatGPT automatic update checks and installation"
   fi
+}
+
+ensure_desktop_auto_updates_disabled() {
+  [ -d "$CHATGPT_APP" ] || return 0
+  disable_desktop_auto_updates && return 0
+  printf '%s start: blocked\n' "$PROGRAM_NAME" >&2
+  printf 'issues:\n- failed to disable ChatGPT Desktop automatic updates\n' >&2
+  printf 'required action:\n' >&2
+  printf '1. defaults write %s SUEnableAutomaticChecks -bool false\n' "$CHATGPT_DEFAULTS_DOMAIN" >&2
+  printf '2. defaults write %s SUAutomaticallyUpdate -bool false\n' "$CHATGPT_DEFAULTS_DOMAIN" >&2
+  printf '3. %s start\n' "$PROGRAM_NAME" >&2
+  return 1
 }
 
 desktop_reuses_daemon() {
@@ -912,15 +924,7 @@ command_start() {
   if [ "${1:-}" = "--force" ]; then allow_unverified=yes; shift; fi
   [ "$#" -eq 0 ] || fail "start accepts only --force"
   require_macos
-  if [ -d "$CHATGPT_APP" ] && ! disable_desktop_auto_updates; then
-    printf '%s start: blocked\n' "$PROGRAM_NAME" >&2
-    printf 'issues:\n- failed to disable ChatGPT Desktop automatic updates\n' >&2
-    printf 'required action:\n' >&2
-    printf '1. defaults write %s SUEnableAutomaticChecks -bool false\n' "$CHATGPT_DEFAULTS_DOMAIN" >&2
-    printf '2. defaults write %s SUAutomaticallyUpdate -bool false\n' "$CHATGPT_DEFAULTS_DOMAIN" >&2
-    printf '3. %s start\n' "$PROGRAM_NAME" >&2
-    return 1
-  fi
+  ensure_desktop_auto_updates_disabled || return 1
   start_preflight "$allow_unverified" || return 1
 
   if [ "$OVERALL_STATE" = "healthy" ]; then
@@ -948,10 +952,14 @@ command_start() {
   else
     start_managed_reuse no
   fi
+  # ChatGPT may rewrite Sparkle preferences while launching. Enforce the pinned
+  # policy again after attachment, then include it in final state verification.
+  ensure_desktop_auto_updates_disabled || return 1
   collect_state
   [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "start verification failed; run $PROGRAM_NAME status"
   [ "$REUSE_ENABLED" = "yes" ] || fail "start verification failed; run $PROGRAM_NAME status"
   [ "$DESKTOP_BACKEND" = "managed-daemon" ] || fail "start verification failed; run $PROGRAM_NAME status"
+  [ "$DESKTOP_AUTO_UPDATES" = "disabled" ] || fail "start verification failed; run $PROGRAM_NAME status"
   log "$PROGRAM_NAME start: healthy"
 }
 

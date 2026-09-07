@@ -48,9 +48,10 @@ app-server、stale runtime、残留 updater 或 unready daemon，再启动 manag
 ChatGPT 并等待它真正接入 managed daemon。可自动处理的动作会逐项记录。
 
 每次 `start` 都会检查并将 ChatGPT 的 Sparkle 首选项 `SUEnableAutomaticChecks` 和
-`SUAutomaticallyUpdate` 写为 `false`，然后验证设置。这样即使应用重新打开过自动更新，
-日常启动也会恢复固定版本策略；`status` 会单独显示该设置是否已禁用。写入失败时工具不会
-继续启动，而会输出两条可手动执行的 `defaults write` 命令。
+`SUAutomaticallyUpdate` 写为 `false`。工具会在打开 ChatGPT 前写入一次，并在 Desktop
+成功接入 daemon 后再次写入和验证，覆盖应用启动期间重写首选项的情况。`status` 会单独
+显示该设置是否已禁用；写入失败时工具不会继续，而会输出两条可手动执行的
+`defaults write` 命令。
 
 安装缺失、Desktop 版本不兼容、Codex CLI 与 managed Codex 版本错位，以及无法证明身份的
 socket/updater 进程不会被静默修改。`start` 会汇总所有 blocker，显示 PID、可执行文件和
