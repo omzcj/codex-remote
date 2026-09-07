@@ -25,6 +25,33 @@ export CODEX_REMOTE_SOURCE_ONLY
 [ "$(json_string_field '{"status":"running","backend":"pid"}' backend)" = "pid" ]
 [ -z "$(json_string_field '{"status":"running"}' backend)" ]
 
+# Newer daemon probes omit backend. Strong process and path evidence must still
+# identify the official remote-control daemon without accepting a plain server.
+(
+  CODEX_HOME_DIR=/tmp/codex-test-home
+  CONTROL_SOCKET="$CODEX_HOME_DIR/app-server-control/app-server-control.sock"
+  DAEMON_BACKEND=""
+  DAEMON_STATUS=running
+  DAEMON_SOCKET_PATH="$CONTROL_SOCKET"
+  DAEMON_MANAGED_CODEX_PATH="$CODEX_HOME_DIR/packages/standalone/current/codex"
+  SERVER_EXECUTABLE="$CODEX_HOME_DIR/packages/standalone/releases/0.153.4-aarch64-apple-darwin/bin/codex"
+  SERVER_COMMAND="$CODEX_HOME_DIR/packages/standalone/current/codex app-server --remote-control --listen unix://"
+  probe_identifies_managed_daemon
+  SERVER_COMMAND="$CODEX_HOME_DIR/packages/standalone/current/codex app-server --listen unix://"
+  if probe_identifies_managed_daemon; then exit 1; fi
+)
+
+# The legacy pid backend remains authoritative for older Codex releases.
+(
+  DAEMON_BACKEND=pid
+  DAEMON_STATUS=""
+  DAEMON_SOCKET_PATH=""
+  DAEMON_MANAGED_CODEX_PATH=""
+  SERVER_EXECUTABLE=""
+  SERVER_COMMAND=""
+  probe_identifies_managed_daemon
+)
+
 # No arguments must dispatch to the read-only status command.
 (
   called=""

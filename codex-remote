@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.06.2"
+PROGRAM_VERSION="2026.09.07.1"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
 LATEST_RELEASE_URL="https://releases.openai.com/codex/channels/latest"
@@ -33,6 +33,9 @@ SERVER_COMMAND=""
 SERVER_EXECUTABLE=""
 MANAGED_PID=""
 DAEMON_BACKEND=""
+DAEMON_STATUS=""
+DAEMON_MANAGED_CODEX_PATH=""
+DAEMON_SOCKET_PATH=""
 DAEMON_PROBE="unreachable"
 DAEMON_OWNERSHIP="stopped"
 UPDATER_PID=""
@@ -209,6 +212,30 @@ desktop_reuses_daemon() {
   return 1
 }
 
+probe_identifies_managed_daemon() {
+  [ "$DAEMON_BACKEND" = "pid" ] && return 0
+  [ "$DAEMON_STATUS" = "running" ] || return 1
+  [ "$DAEMON_SOCKET_PATH" = "$CONTROL_SOCKET" ] || return 1
+  case "$DAEMON_MANAGED_CODEX_PATH" in
+    "$CODEX_HOME_DIR/packages/standalone/current/codex"|\
+    "$CODEX_HOME_DIR/packages/standalone/current/bin/codex") ;;
+    *) return 1 ;;
+  esac
+  case "$SERVER_EXECUTABLE" in
+    "$CODEX_HOME_DIR/packages/standalone/releases/"*/bin/codex|\
+    "$CODEX_HOME_DIR/packages/standalone/releases/"*/codex) ;;
+    *) return 1 ;;
+  esac
+  case "$SERVER_COMMAND" in
+    *codex*" app-server "*"--remote-control"*) ;;
+    *) return 1 ;;
+  esac
+  case "$SERVER_COMMAND" in
+    *"--listen unix://"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_safe_updater_pid() {
   target_pid="${1:-}"
   expected_start="$(pid_start_from_file "$UPDATER_PID_FILE" || true)"
@@ -256,6 +283,9 @@ collect_state() {
   SERVER_EXECUTABLE=""
   MANAGED_PID=""
   DAEMON_BACKEND=""
+  DAEMON_STATUS=""
+  DAEMON_MANAGED_CODEX_PATH=""
+  DAEMON_SOCKET_PATH=""
   DAEMON_PROBE="unreachable"
   DAEMON_OWNERSHIP="stopped"
   UPDATER_PID=""
@@ -288,7 +318,10 @@ collect_state() {
   if [ -n "$probe_bin" ]; then
     if DAEMON_VERSION_OUTPUT="$("$probe_bin" app-server daemon version 2>&1)"; then
       DAEMON_PROBE="ready"
+      DAEMON_STATUS="$(json_string_field "$DAEMON_VERSION_OUTPUT" status || true)"
       DAEMON_BACKEND="$(json_string_field "$DAEMON_VERSION_OUTPUT" backend || true)"
+      DAEMON_MANAGED_CODEX_PATH="$(json_string_field "$DAEMON_VERSION_OUTPUT" managedCodexPath || true)"
+      DAEMON_SOCKET_PATH="$(json_string_field "$DAEMON_VERSION_OUTPUT" socketPath || true)"
       RUNNING_VERSION="$(json_string_field "$DAEMON_VERSION_OUTPUT" appServerVersion || true)"
     fi
   fi
@@ -297,8 +330,17 @@ collect_state() {
     MANAGED_PID="$(pid_from_file "$APP_SERVER_PID_FILE")"
   fi
 
+  if [ -n "$SERVER_PID" ] && pid_alive "$SERVER_PID"; then
+    SERVER_COMMAND="$(process_command "$SERVER_PID" || true)"
+    SERVER_EXECUTABLE="$(process_executable "$SERVER_PID" || true)"
+    if [ -z "$RUNNING_VERSION" ] && [ -x "$SERVER_EXECUTABLE" ]; then
+      RUNNING_VERSION="$(codex_version "$SERVER_EXECUTABLE" || true)"
+    fi
+  fi
+
   if [ "$DAEMON_PROBE" = "ready" ]; then
-    if [ "$DAEMON_BACKEND" = "pid" ]; then
+    if probe_identifies_managed_daemon; then
+      [ -n "$DAEMON_BACKEND" ] || DAEMON_BACKEND="remote-control"
       DAEMON_OWNERSHIP="managed"
     else
       DAEMON_OWNERSHIP="unmanaged"
@@ -312,14 +354,6 @@ collect_state() {
     DAEMON_OWNERSHIP="stale-socket"
   else
     DAEMON_OWNERSHIP="stopped"
-  fi
-
-  if [ -n "$SERVER_PID" ] && pid_alive "$SERVER_PID"; then
-    SERVER_COMMAND="$(process_command "$SERVER_PID" || true)"
-    SERVER_EXECUTABLE="$(process_executable "$SERVER_PID" || true)"
-    if [ -z "$RUNNING_VERSION" ] && [ -x "$SERVER_EXECUTABLE" ]; then
-      RUNNING_VERSION="$(codex_version "$SERVER_EXECUTABLE" || true)"
-    fi
   fi
 
   UPDATER_PID="$(pid_from_file "$UPDATER_PID_FILE" || true)"

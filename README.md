@@ -33,7 +33,9 @@ codex-remote update 0.153.4     # 安装或回滚到指定版本
 `status` 会区分 `managed`、`unmanaged`、版本错位和 stale socket，而不是只根据
 `daemon version` 是否成功判断。它会同时列出所有检测到的问题，并将 Desktop
 安装/版本、runtime 清理、Codex 更新、启用复用、启动 Desktop 和最终复查合并为一组
-去重且有顺序的恢复步骤。无参数运行不会修改系统状态。
+去重且有顺序的恢复步骤。对于新版不再返回 `backend` 字段的 daemon，会结合
+`managedCodexPath`、control socket、官方可执行文件和 `--remote-control` 进程参数确认
+ownership，避免对正常复用产生假阳性。无参数运行不会修改系统状态。
 
 `enable` 只接受官方 standalone managed binary。发现 unmanaged app-server 或 stale
 socket 时会拒绝继续，并要求先运行 `reset`。ChatGPT Desktop 版本不是已验证的
