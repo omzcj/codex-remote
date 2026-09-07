@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.07.2"
+PROGRAM_VERSION="2026.09.07.3"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
 LATEST_RELEASE_URL="https://releases.openai.com/codex/channels/latest"
@@ -138,6 +138,9 @@ Running without a command is read-only and equivalent to status.
 
 Commands:
   status                 Show all detected issues and an ordered recovery plan
+  start [--force]        Repair safe runtime issues, open Desktop, and verify reuse
+  stop                   Stop Desktop and reset the shared daemon runtime
+  restart [--force]      Stop everything, then start and verify it again
   enable [--force]       Enable and verify Desktop reuse of a managed daemon
   reset                  Disable reuse and stop all related daemon processes
   update check           Check the latest standalone Codex version
@@ -149,9 +152,10 @@ Options:
   -h, --help             Show this help
   -v, --version          Show the installed version
 
-enable requires the official standalone Codex installation. It never installs,
-bootstraps, or updates Codex implicitly. reset interrupts clients connected to
-the shared daemon, but never deletes Codex configuration, auth, or thread data.
+start and enable require the official standalone Codex installation. They never
+install, bootstrap, or update Codex implicitly. stop, restart, and reset interrupt
+clients connected to the shared daemon, but never delete Codex configuration,
+auth, or thread data.
 EOF
 }
 
@@ -557,11 +561,21 @@ open_chatgpt() {
 }
 
 enable_reuse() {
-  gui_launchctl setenv "$ENV_NAME" 1 || fail "failed to set $ENV_NAME in the GUI bootstrap domain"
+  gui_launchctl setenv "$ENV_NAME" 1 || {
+    printf '%s: blocked\n' "$PROGRAM_NAME" >&2
+    printf 'issues:\n- failed to set %s in the GUI bootstrap domain\n' "$ENV_NAME" >&2
+    printf 'required action:\n1. Log in to the Mac desktop session\n2. %s start\n' "$PROGRAM_NAME" >&2
+    exit 1
+  }
 }
 
 disable_reuse() {
-  gui_launchctl unsetenv "$ENV_NAME" || fail "failed to clear $ENV_NAME in the GUI bootstrap domain"
+  gui_launchctl unsetenv "$ENV_NAME" || {
+    printf '%s: blocked\n' "$PROGRAM_NAME" >&2
+    printf 'issues:\n- failed to clear %s in the GUI bootstrap domain\n' "$ENV_NAME" >&2
+    printf 'required action:\n1. Log in to the Mac desktop session\n2. %s stop\n' "$PROGRAM_NAME" >&2
+    exit 1
+  }
 }
 
 print_status() {
@@ -598,79 +612,76 @@ print_recovery_step() {
 print_issues_and_recovery() {
   STATUS_ISSUE_COUNT=0
   STATUS_RECOVERY_STEP=0
+  STATUS_NEEDS_DESKTOP_INSTALL=no
   STATUS_NEEDS_DESKTOP_REINSTALL=no
-  STATUS_NEEDS_RESET=no
   STATUS_NEEDS_CODEX_UPDATE=no
-  STATUS_NEEDS_ENABLE=no
+  STATUS_NEEDS_START=no
 
   printf 'issues:\n'
   case "$DESKTOP_COMPATIBILITY" in
     missing)
       print_issue "ChatGPT Desktop is not installed at $CHATGPT_APP"
-      STATUS_NEEDS_DESKTOP_REINSTALL=yes
-      STATUS_NEEDS_ENABLE=yes
+      STATUS_NEEDS_DESKTOP_INSTALL=yes
+      STATUS_NEEDS_START=yes
       ;;
     unverified)
       print_issue "ChatGPT Desktop $CHATGPT_VERSION is unverified; supported version is $SUPPORTED_DESKTOP_VERSION"
       STATUS_NEEDS_DESKTOP_REINSTALL=yes
-      STATUS_NEEDS_ENABLE=yes
+      STATUS_NEEDS_START=yes
       ;;
   esac
 
   if [ -z "$MANAGED_VERSION" ]; then
     print_issue "official standalone managed Codex is not installed"
-    STATUS_NEEDS_ENABLE=yes
+    STATUS_NEEDS_START=yes
   fi
 
   case "$DAEMON_OWNERSHIP" in
     unmanaged)
       print_issue "an unmanaged app-server owns the control socket"
-      STATUS_NEEDS_RESET=yes
-      STATUS_NEEDS_ENABLE=yes
+      STATUS_NEEDS_START=yes
       ;;
     stale-socket)
       print_issue "the app-server control socket is stale"
-      STATUS_NEEDS_ENABLE=yes
+      STATUS_NEEDS_START=yes
       ;;
     managed-unready)
       print_issue "the managed daemon has not become ready"
-      STATUS_NEEDS_RESET=yes
-      STATUS_NEEDS_ENABLE=yes
+      STATUS_NEEDS_START=yes
       ;;
     stopped)
       print_issue "the managed daemon is stopped"
-      STATUS_NEEDS_ENABLE=yes
+      STATUS_NEEDS_START=yes
       ;;
   esac
 
   if [ -n "$MANAGED_VERSION" ] && [ -n "$RUNNING_VERSION" ] && [ "$MANAGED_VERSION" != "$RUNNING_VERSION" ]; then
     print_issue "running app-server $RUNNING_VERSION differs from installed managed Codex $MANAGED_VERSION"
-    STATUS_NEEDS_ENABLE=yes
+    STATUS_NEEDS_START=yes
   fi
 
   if [ "$UPDATER_STATE" != "stopped" ]; then
     print_issue "the standalone updater state is $UPDATER_STATE"
-    STATUS_NEEDS_RESET=yes
-    STATUS_NEEDS_ENABLE=yes
+    STATUS_NEEDS_START=yes
   fi
 
   if [ -n "$CLI_VERSION" ] && [ -n "$MANAGED_VERSION" ] && [ "$CLI_VERSION" != "$MANAGED_VERSION" ]; then
     print_issue "Codex CLI $CLI_VERSION differs from managed Codex $MANAGED_VERSION"
     STATUS_NEEDS_CODEX_UPDATE=yes
-    STATUS_NEEDS_ENABLE=yes
+    STATUS_NEEDS_START=yes
   fi
 
   if [ "$REUSE_ENABLED" = "no" ]; then
     print_issue "Desktop daemon reuse is disabled"
-    STATUS_NEEDS_ENABLE=yes
+    STATUS_NEEDS_START=yes
   fi
 
   if [ -z "$CHATGPT_PIDS" ]; then
     print_issue "ChatGPT Desktop is not running"
-    STATUS_NEEDS_ENABLE=yes
+    STATUS_NEEDS_START=yes
   elif [ "$DESKTOP_BACKEND" != "managed-daemon" ]; then
     print_issue "ChatGPT Desktop is not attached to the managed daemon"
-    STATUS_NEEDS_ENABLE=yes
+    STATUS_NEEDS_START=yes
   fi
 
   if [ "$STATUS_ISSUE_COUNT" -eq 0 ]; then
@@ -680,20 +691,20 @@ print_issues_and_recovery() {
   fi
 
   printf 'recommended recovery:\n'
+  if [ "$STATUS_NEEDS_DESKTOP_INSTALL" = "yes" ]; then
+    print_recovery_step "brew install --cask $PINNED_DESKTOP_CASK"
+  fi
   if [ "$STATUS_NEEDS_DESKTOP_REINSTALL" = "yes" ]; then
     print_recovery_step "brew reinstall --cask $PINNED_DESKTOP_CASK"
   fi
   if [ -z "$MANAGED_VERSION" ]; then
     print_recovery_step "curl -fsSL $INSTALL_URL | sh"
   fi
-  if [ "$STATUS_NEEDS_RESET" = "yes" ]; then
-    print_recovery_step "$PROGRAM_NAME reset"
-  fi
   if [ "$STATUS_NEEDS_CODEX_UPDATE" = "yes" ]; then
     print_recovery_step "$PROGRAM_NAME update latest"
   fi
-  if [ "$STATUS_NEEDS_ENABLE" = "yes" ]; then
-    print_recovery_step "$PROGRAM_NAME enable"
+  if [ "$STATUS_NEEDS_START" = "yes" ]; then
+    print_recovery_step "$PROGRAM_NAME start"
   fi
   print_recovery_step "$PROGRAM_NAME status"
 }
@@ -713,6 +724,175 @@ wait_for_desktop_attach() {
     waited=$((waited + 1))
   done
   return 1
+}
+
+brew_available() {
+  command -v brew >/dev/null 2>&1
+}
+
+print_start_action() {
+  START_ACTION_NUMBER=$((START_ACTION_NUMBER + 1))
+  printf '%s. %s\n' "$START_ACTION_NUMBER" "$1"
+}
+
+start_preflight() {
+  allow_unverified="$1"
+  require_macos
+  collect_state
+
+  START_BLOCK_COUNT=0
+  START_NEEDS_DESKTOP_INSTALL=no
+  START_NEEDS_DESKTOP_REINSTALL=no
+  START_NEEDS_CODEX_INSTALL=no
+  START_NEEDS_CODEX_UPDATE=no
+  START_UNKNOWN_SOCKET=no
+  START_UNKNOWN_UPDATER=no
+  START_SOCKET_OWNER_PIDS=""
+
+  case "$DESKTOP_COMPATIBILITY" in
+    missing)
+      START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
+      START_NEEDS_DESKTOP_INSTALL=yes
+      ;;
+    unverified)
+      if [ "$allow_unverified" != "yes" ]; then
+        START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
+        START_NEEDS_DESKTOP_REINSTALL=yes
+      fi
+      ;;
+  esac
+
+  if [ -z "$MANAGED_VERSION" ]; then
+    START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
+    START_NEEDS_CODEX_INSTALL=yes
+  fi
+  if [ -n "$CLI_VERSION" ] && [ -n "$MANAGED_VERSION" ] && [ "$CLI_VERSION" != "$MANAGED_VERSION" ]; then
+    START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
+    START_NEEDS_CODEX_UPDATE=yes
+  fi
+
+  if [ "$DAEMON_OWNERSHIP" = "unmanaged" ]; then
+    START_SOCKET_OWNER_PIDS="$(socket_owner_pids || true)"
+    expected_start=""
+    [ -z "$SERVER_PID" ] || expected_start="$(process_start_time "$SERVER_PID" || true)"
+    if [ -z "$SERVER_PID" ] || [ -z "$expected_start" ] || \
+       ! is_safe_app_server_pid "$SERVER_PID" "$expected_start"; then
+      START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
+      START_UNKNOWN_SOCKET=yes
+    fi
+  fi
+
+  case "$UPDATER_STATE" in
+    invalid|ambiguous)
+      START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
+      START_UNKNOWN_UPDATER=yes
+      ;;
+  esac
+
+  [ "$START_BLOCK_COUNT" -gt 0 ] || return 0
+
+  printf '%s start: blocked\n' "$PROGRAM_NAME"
+  printf 'issues:\n'
+  if [ "$START_NEEDS_DESKTOP_INSTALL" = "yes" ]; then
+    printf -- '- ChatGPT Desktop is not installed at %s\n' "$CHATGPT_APP"
+  fi
+  if [ "$START_NEEDS_DESKTOP_REINSTALL" = "yes" ]; then
+    printf -- '- ChatGPT Desktop %s is unverified; supported version is %s\n' \
+      "${CHATGPT_VERSION:-unknown}" "$SUPPORTED_DESKTOP_VERSION"
+  fi
+  if [ "$START_NEEDS_CODEX_INSTALL" = "yes" ]; then
+    printf -- '- official standalone managed Codex is not installed\n'
+  fi
+  if [ "$START_NEEDS_CODEX_UPDATE" = "yes" ]; then
+    printf -- '- Codex CLI %s differs from managed Codex %s\n' "$CLI_VERSION" "$MANAGED_VERSION"
+  fi
+  if [ "$START_UNKNOWN_SOCKET" = "yes" ]; then
+    printf -- '- unknown process ownership prevents safe app-server cleanup\n'
+    [ -z "$START_SOCKET_OWNER_PIDS" ] || printf '  socket owner PID(s): %s\n' \
+      "$(printf '%s' "$START_SOCKET_OWNER_PIDS" | /usr/bin/tr '\n' ' ')"
+    [ -z "$SERVER_EXECUTABLE" ] || printf '  executable: %s\n' "$SERVER_EXECUTABLE"
+    [ -z "$SERVER_COMMAND" ] || printf '  command: %s\n' "$SERVER_COMMAND"
+    printf '  no process was terminated\n'
+  fi
+  if [ "$START_UNKNOWN_UPDATER" = "yes" ]; then
+    printf -- '- standalone updater state is %s and its process identity is not safe to assume\n' "$UPDATER_STATE"
+    [ -z "$UPDATER_PID" ] || printf '  updater PID: %s\n' "$UPDATER_PID"
+    printf '  no process was terminated\n'
+  fi
+
+  printf 'required action:\n'
+  START_ACTION_NUMBER=0
+  if { [ "$START_NEEDS_DESKTOP_INSTALL" = "yes" ] || \
+       [ "$START_NEEDS_DESKTOP_REINSTALL" = "yes" ]; } && ! brew_available; then
+    print_start_action "Install Homebrew from https://brew.sh"
+  fi
+  if [ "$START_NEEDS_DESKTOP_INSTALL" = "yes" ]; then
+    print_start_action "brew install --cask $PINNED_DESKTOP_CASK"
+  fi
+  if [ "$START_NEEDS_DESKTOP_REINSTALL" = "yes" ]; then
+    print_start_action "brew reinstall --cask $PINNED_DESKTOP_CASK"
+  fi
+  if [ "$START_NEEDS_CODEX_INSTALL" = "yes" ]; then
+    print_start_action "curl -fsSL $INSTALL_URL | sh"
+  fi
+  if [ "$START_NEEDS_CODEX_UPDATE" = "yes" ]; then
+    print_start_action "$PROGRAM_NAME update latest"
+  fi
+  if [ "$START_UNKNOWN_SOCKET" = "yes" ]; then
+    for process_id in $START_SOCKET_OWNER_PIDS; do
+      print_start_action "ps -p $process_id -o pid=,uid=,lstart=,command="
+    done
+    print_start_action "Close the application that owns the control socket"
+  fi
+  if [ "$START_UNKNOWN_UPDATER" = "yes" ]; then
+    [ -z "$UPDATER_PID" ] || print_start_action \
+      "ps -p $UPDATER_PID -o pid=,uid=,lstart=,command="
+    print_start_action "Close the unknown updater process or remove the conflicting PID record after inspection"
+  fi
+  if [ "$allow_unverified" = "yes" ]; then
+    print_start_action "$PROGRAM_NAME start --force"
+  else
+    print_start_action "$PROGRAM_NAME start"
+  fi
+  if [ "$START_NEEDS_DESKTOP_REINSTALL" = "yes" ]; then
+    printf 'alternative for temporary validation:\n  %s start --force\n' "$PROGRAM_NAME"
+  fi
+  return 1
+}
+
+command_start() {
+  allow_unverified=no
+  if [ "${1:-}" = "--force" ]; then allow_unverified=yes; shift; fi
+  [ "$#" -eq 0 ] || fail "start accepts only --force"
+  start_preflight "$allow_unverified" || return 1
+
+  if [ "$OVERALL_STATE" = "healthy" ]; then
+    log "$PROGRAM_NAME start: healthy"
+    return
+  fi
+
+  needs_reset=no
+  case "$DAEMON_OWNERSHIP" in
+    unmanaged|managed-unready|stale-socket) needs_reset=yes ;;
+  esac
+  case "$UPDATER_STATE" in
+    running|stale|orphan) needs_reset=yes ;;
+  esac
+  if [ "$needs_reset" = "yes" ]; then
+    log "repairing shared daemon runtime before start"
+    command_reset
+  fi
+
+  if [ "$allow_unverified" = "yes" ]; then
+    command_enable --force
+  else
+    command_enable
+  fi
+  collect_state
+  [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "start verification failed; run $PROGRAM_NAME status"
+  [ "$REUSE_ENABLED" = "yes" ] || fail "start verification failed; run $PROGRAM_NAME status"
+  [ "$DESKTOP_BACKEND" = "managed-daemon" ] || fail "start verification failed; run $PROGRAM_NAME status"
+  log "$PROGRAM_NAME start: healthy"
 }
 
 command_enable() {
@@ -836,6 +1016,27 @@ command_reset() {
   log "Desktop daemon reuse is disabled, shared daemon state is reset, and ChatGPT is stopped"
 }
 
+command_stop() {
+  [ "$#" -eq 0 ] || fail "stop does not accept arguments"
+  command_reset
+}
+
+command_restart() {
+  allow_unverified=no
+  if [ "${1:-}" = "--force" ]; then allow_unverified=yes; shift; fi
+  [ "$#" -eq 0 ] || fail "restart accepts only --force"
+
+  # Preflight before interrupting a healthy session. Installation, compatibility,
+  # or unknown-process blockers must be resolved before restart tears anything down.
+  start_preflight "$allow_unverified" || return 1
+  command_reset
+  if [ "$allow_unverified" = "yes" ]; then
+    command_start --force
+  else
+    command_start
+  fi
+}
+
 latest_release_version() {
   release_json="$(/usr/bin/curl -fsSL --connect-timeout 10 --max-time 30 "$LATEST_RELEASE_URL")" || return 1
   resolved_release="$(printf '%s\n' "$release_json" | /usr/bin/sed -n \
@@ -936,6 +1137,9 @@ main() {
   if [ "$#" -gt 0 ]; then shift; fi
   case "$command_name" in
     status) [ "$#" -eq 0 ] || fail "status does not accept arguments"; command_status ;;
+    start) command_start "$@" ;;
+    stop) command_stop "$@" ;;
+    restart) command_restart "$@" ;;
     enable) command_enable "$@" ;;
     reset) command_reset "$@" ;;
     update) command_update "$@" ;;
