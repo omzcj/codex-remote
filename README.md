@@ -37,13 +37,21 @@ codex-remote update 0.153.4     # 安装或回滚到指定版本
 `managedCodexPath`、control socket、官方可执行文件和 `--remote-control` 进程参数确认
 ownership，避免对正常复用产生假阳性。无参数运行不会修改系统状态。
 
+reuse 环境变量始终读写登录用户的 `gui/<uid>` launchd bootstrap domain；从 SSH 执行时
+会通过一次性 LaunchAgent 完成写入，随后立即卸载。因此本地终端、Desktop 和 SSH 的行为
+一致，远程执行 `enable` 后新启动的 ChatGPT 也能继承配置，且不需要 sudo。
+
 `enable` 只接受官方 standalone managed binary。发现 unmanaged app-server 或 stale
 socket 时会拒绝继续，并要求先运行 `reset`。ChatGPT Desktop 版本不是已验证的
 `26.818.61809` 时，默认拒绝启用；如需自行验证可使用 `enable --force`。
 
-`reset` 是故障恢复命令，会中断连接 shared daemon 的 Desktop、CLI、SSH 或移动端任务。
+`reset` 是故障恢复命令，会中断连接 shared daemon 的 Desktop、CLI、SSH 或移动端任务，
+成功后保持 ChatGPT 关闭，避免它在后续 `enable` 前抢占 control socket。
 它只终止占用当前 `CODEX_HOME` control socket 的精确 app-server PID 和经过校验的 updater
 PID，不会使用 `pkill codex`，也不会删除配置、认证、线程、日志或 standalone releases。
+
+`enable` 会启动 managed daemon、设置 GUI reuse 环境、打开或重启 ChatGPT，并等待 Desktop
+真正连接后才返回成功。
 
 `update` 只更新 standalone Codex/app-server，不更新 ChatGPT.app。运行中的 daemon 必须
 处于 managed 状态；升级后工具会按需重启 daemon 和正在复用它的 Desktop。工具不会启动

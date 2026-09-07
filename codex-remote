@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.07.1"
+PROGRAM_VERSION="2026.09.07.2"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
 LATEST_RELEASE_URL="https://releases.openai.com/codex/channels/latest"
@@ -50,6 +50,78 @@ DAEMON_VERSION_OUTPUT=""
 
 log() {
   printf '%s %s\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+gui_launchctl() {
+  gui_action="$1"
+  shift
+  case "$gui_action" in
+    getenv) gui_environment_value "$1" ;;
+    setenv|unsetenv) gui_launchctl_mutate "$gui_action" "$@" ;;
+    *) return 2 ;;
+  esac
+}
+
+gui_environment_value() {
+  gui_env_name="$1"
+  gui_uid="$(/usr/bin/id -u)"
+  /bin/launchctl print "gui/$gui_uid" 2>/dev/null | /usr/bin/awk -v env_name="$gui_env_name" '
+    /^[[:space:]]*environment = \{/ { in_environment = 1; next }
+    in_environment && /^[[:space:]]*\}/ { exit }
+    in_environment && $1 == env_name && $2 == "=>" { print $3; exit }
+  '
+}
+
+gui_launchctl_mutate() {
+  gui_action="$1"
+  shift
+  gui_env_name="$1"
+  shift
+  gui_env_value="${1:-}"
+  gui_uid="$(/usr/bin/id -u)"
+  gui_label="com.omzcj.codex-remote.gui-env.$$.$gui_action"
+  gui_temp_dir="$(/usr/bin/mktemp -d -t codex-remote-gui-env)" || return 1
+  gui_plist="$gui_temp_dir/$gui_label.plist"
+
+  /usr/bin/plutil -create xml1 "$gui_plist" || { /bin/rmdir "$gui_temp_dir"; return 1; }
+  /usr/bin/plutil -insert Label -string "$gui_label" "$gui_plist" || { /bin/rm -f "$gui_plist"; /bin/rmdir "$gui_temp_dir"; return 1; }
+  /usr/bin/plutil -insert ProgramArguments -array "$gui_plist" || { /bin/rm -f "$gui_plist"; /bin/rmdir "$gui_temp_dir"; return 1; }
+  /usr/bin/plutil -insert ProgramArguments.0 -string /bin/launchctl "$gui_plist" || { /bin/rm -f "$gui_plist"; /bin/rmdir "$gui_temp_dir"; return 1; }
+  /usr/bin/plutil -insert ProgramArguments.1 -string "$gui_action" "$gui_plist" || { /bin/rm -f "$gui_plist"; /bin/rmdir "$gui_temp_dir"; return 1; }
+  /usr/bin/plutil -insert ProgramArguments.2 -string "$gui_env_name" "$gui_plist" || { /bin/rm -f "$gui_plist"; /bin/rmdir "$gui_temp_dir"; return 1; }
+  if [ "$gui_action" = "setenv" ]; then
+    /usr/bin/plutil -insert ProgramArguments.3 -string "$gui_env_value" "$gui_plist" || {
+      /bin/rm -f "$gui_plist"
+      /bin/rmdir "$gui_temp_dir"
+      return 1
+    }
+  fi
+  /usr/bin/plutil -insert RunAtLoad -bool true "$gui_plist" || { /bin/rm -f "$gui_plist"; /bin/rmdir "$gui_temp_dir"; return 1; }
+
+  if ! /bin/launchctl bootstrap "gui/$gui_uid" "$gui_plist"; then
+    /bin/rm -f "$gui_plist"
+    /bin/rmdir "$gui_temp_dir"
+    return 1
+  fi
+  gui_waited=0
+  gui_changed=no
+  while [ "$gui_waited" -lt 5 ]; do
+    gui_actual_value="$(gui_environment_value "$gui_env_name" || true)"
+    if [ "$gui_action" = "setenv" ] && [ "$gui_actual_value" = "$gui_env_value" ]; then
+      gui_changed=yes
+      break
+    fi
+    if [ "$gui_action" = "unsetenv" ] && [ -z "$gui_actual_value" ]; then
+      gui_changed=yes
+      break
+    fi
+    /bin/sleep 1
+    gui_waited=$((gui_waited + 1))
+  done
+  /bin/launchctl bootout "gui/$gui_uid/$gui_label" >/dev/null 2>&1 || true
+  /bin/rm -f "$gui_plist"
+  /bin/rmdir "$gui_temp_dir"
+  [ "$gui_changed" = "yes" ]
 }
 
 fail() {
@@ -297,7 +369,7 @@ collect_state() {
   OVERALL_STATE="disabled"
   DAEMON_VERSION_OUTPUT=""
 
-  reuse_value="$(/bin/launchctl getenv "$ENV_NAME" 2>/dev/null || true)"
+  reuse_value="$(gui_launchctl getenv "$ENV_NAME" 2>/dev/null || true)"
   if [ "$reuse_value" = "1" ]; then REUSE_ENABLED="yes"; else REUSE_ENABLED="no"; fi
   if find_codex; then CLI_VERSION="$(codex_version "$CODEX_BIN" || true)"; fi
   if find_managed_codex; then MANAGED_VERSION="$(codex_version "$MANAGED_CODEX_BIN" || true)"; fi
@@ -485,11 +557,11 @@ open_chatgpt() {
 }
 
 enable_reuse() {
-  /bin/launchctl setenv "$ENV_NAME" 1 || fail "failed to set $ENV_NAME"
+  gui_launchctl setenv "$ENV_NAME" 1 || fail "failed to set $ENV_NAME in the GUI bootstrap domain"
 }
 
 disable_reuse() {
-  /bin/launchctl unsetenv "$ENV_NAME" || fail "failed to clear $ENV_NAME"
+  gui_launchctl unsetenv "$ENV_NAME" || fail "failed to clear $ENV_NAME in the GUI bootstrap domain"
 }
 
 print_status() {
@@ -530,7 +602,6 @@ print_issues_and_recovery() {
   STATUS_NEEDS_RESET=no
   STATUS_NEEDS_CODEX_UPDATE=no
   STATUS_NEEDS_ENABLE=no
-  STATUS_NEEDS_OPEN=no
 
   printf 'issues:\n'
   case "$DESKTOP_COMPATIBILITY" in
@@ -538,13 +609,11 @@ print_issues_and_recovery() {
       print_issue "ChatGPT Desktop is not installed at $CHATGPT_APP"
       STATUS_NEEDS_DESKTOP_REINSTALL=yes
       STATUS_NEEDS_ENABLE=yes
-      STATUS_NEEDS_OPEN=yes
       ;;
     unverified)
       print_issue "ChatGPT Desktop $CHATGPT_VERSION is unverified; supported version is $SUPPORTED_DESKTOP_VERSION"
       STATUS_NEEDS_DESKTOP_REINSTALL=yes
       STATUS_NEEDS_ENABLE=yes
-      STATUS_NEEDS_OPEN=yes
       ;;
   esac
 
@@ -598,7 +667,7 @@ print_issues_and_recovery() {
 
   if [ -z "$CHATGPT_PIDS" ]; then
     print_issue "ChatGPT Desktop is not running"
-    STATUS_NEEDS_OPEN=yes
+    STATUS_NEEDS_ENABLE=yes
   elif [ "$DESKTOP_BACKEND" != "managed-daemon" ]; then
     print_issue "ChatGPT Desktop is not attached to the managed daemon"
     STATUS_NEEDS_ENABLE=yes
@@ -625,9 +694,6 @@ print_issues_and_recovery() {
   fi
   if [ "$STATUS_NEEDS_ENABLE" = "yes" ]; then
     print_recovery_step "$PROGRAM_NAME enable"
-  fi
-  if [ "$STATUS_NEEDS_OPEN" = "yes" ]; then
-    print_recovery_step "open $CHATGPT_APP"
   fi
   print_recovery_step "$PROGRAM_NAME status"
 }
@@ -691,11 +757,9 @@ command_enable() {
       disable_reuse
       fail "ChatGPT did not exit cleanly; close it and rerun $PROGRAM_NAME enable"
     fi
-    open_chatgpt || fail "failed to reopen ChatGPT"
-    wait_for_desktop_attach || fail "ChatGPT did not connect to the managed daemon; run $PROGRAM_NAME status"
-  else
-    log "reuse enabled; ChatGPT will connect when it next opens"
   fi
+  open_chatgpt || fail "failed to open ChatGPT"
+  wait_for_desktop_attach || fail "ChatGPT did not connect to the managed daemon; run $PROGRAM_NAME status"
   log "Desktop daemon reuse is enabled"
 }
 
@@ -765,12 +829,11 @@ command_reset() {
     terminate_app_server "$SERVER_PID" || fail "refusing or failing to stop app-server PID $SERVER_PID"
   fi
   cleanup_runtime_records || fail "runtime ownership changed; no socket or PID records were removed"
-  if [ "$was_running" = "yes" ]; then open_chatgpt || fail "shared daemon stopped, but ChatGPT could not be reopened"; fi
   collect_state
   case "$DAEMON_OWNERSHIP" in stopped|stale-socket) ;; *) fail "reset did not stop the shared daemon" ;; esac
   [ "$UPDATER_STATE" = "stopped" ] || fail "reset did not fully stop the updater"
   [ "$DESKTOP_BACKEND" != "managed-daemon" ] || fail "Desktop still uses the managed daemon"
-  log "Desktop daemon reuse is disabled and shared daemon state is reset"
+  log "Desktop daemon reuse is disabled, shared daemon state is reset, and ChatGPT is stopped"
 }
 
 latest_release_version() {

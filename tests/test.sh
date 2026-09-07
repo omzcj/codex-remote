@@ -25,6 +25,18 @@ export CODEX_REMOTE_SOURCE_ONLY
 [ "$(json_string_field '{"status":"running","backend":"pid"}' backend)" = "pid" ]
 [ -z "$(json_string_field '{"status":"running"}' backend)" ]
 
+# Reuse settings must target the GUI bootstrap domain even when invoked by SSH.
+(
+  observed=""
+  gui_environment_value() { [ "$1" = "TEST_VALUE" ] && printf '1\n'; }
+  gui_launchctl_mutate() { observed="$*"; }
+  [ "$(gui_launchctl getenv TEST_VALUE)" = "1" ]
+  gui_launchctl setenv TEST_VALUE 1
+  [ "$observed" = "setenv TEST_VALUE 1" ]
+  gui_launchctl unsetenv TEST_VALUE
+  [ "$observed" = "unsetenv TEST_VALUE" ]
+)
+
 # Newer daemon probes omit backend. Strong process and path evidence must still
 # identify the official remote-control daemon without accepting a plain server.
 (
@@ -107,8 +119,7 @@ printf '%s\n' "$combined_status_output" | grep -F "ChatGPT Desktop is not runnin
 printf '%s\n' "$combined_status_output" | grep -F "1. brew reinstall --cask omzcj/omzcj/chatgpt" >/dev/null
 printf '%s\n' "$combined_status_output" | grep -F "2. codex-remote reset" >/dev/null
 printf '%s\n' "$combined_status_output" | grep -F "3. codex-remote enable" >/dev/null
-printf '%s\n' "$combined_status_output" | grep -F "4. open /Applications/ChatGPT.app" >/dev/null
-printf '%s\n' "$combined_status_output" | grep -F "5. codex-remote status" >/dev/null
+printf '%s\n' "$combined_status_output" | grep -F "4. codex-remote status" >/dev/null
 
 # A healthy state must not invent recovery work.
 healthy_status_output="$( (
@@ -176,6 +187,27 @@ printf '%s\n' "$missing_backend_error" | grep -F "daemon is not managed" >/dev/n
   stop_chatgpt() { exit 1; }
   CHATGPT_APP=/tmp
   command_enable
+)
+
+# enable must open and verify Desktop even when it was initially stopped.
+(
+  order=""
+  require_macos() { :; }
+  find_managed_codex() { MANAGED_CODEX_BIN=/usr/bin/true; MANAGED_VERSION=0.153.4; return 0; }
+  collect_state() {
+    DESKTOP_COMPATIBILITY=verified
+    OVERALL_STATE=waiting-for-desktop
+    DAEMON_OWNERSHIP=managed
+    MANAGED_VERSION=0.153.4
+    RUNNING_VERSION=0.153.4
+    CHATGPT_PIDS=""
+  }
+  enable_reuse() { order="${order}reuse "; }
+  open_chatgpt() { order="${order}open "; }
+  wait_for_desktop_attach() { order="${order}verify "; }
+  CHATGPT_APP=/tmp
+  command_enable
+  [ "$order" = "reuse open verify " ]
 )
 
 # update must apply the same unmanaged guard before invoking the installer.
@@ -249,6 +281,26 @@ printf '%s\n' "$update_error" | grep -F "run codex-remote reset first" >/dev/nul
   cleanup_runtime_records() { order="${order}cleanup "; }
   command_reset
   [ "$order" = "disable updater cleanup " ]
+)
+
+# A successful reset leaves Desktop stopped so enable cannot race a new direct server.
+(
+  collect_count=0
+  require_macos() { :; }
+  collect_state() {
+    collect_count=$((collect_count + 1))
+    if [ "$collect_count" -eq 1 ]; then CHATGPT_PIDS=42; else CHATGPT_PIDS=""; fi
+    DAEMON_OWNERSHIP=stopped
+    SERVER_PID=""
+    UPDATER_STATE=stopped
+    DESKTOP_BACKEND=inactive
+  }
+  disable_reuse() { :; }
+  stop_chatgpt() { :; }
+  stop_updater() { :; }
+  cleanup_runtime_records() { :; }
+  open_chatgpt() { exit 1; }
+  command_reset
 )
 
 # A valid but unready managed PID must still be stopped through the official lifecycle.
