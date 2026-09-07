@@ -34,6 +34,36 @@ export CODEX_REMOTE_SOURCE_ONLY
 [ "$(json_string_field '{"status":"running","backend":"pid"}' backend)" = "pid" ]
 [ -z "$(json_string_field '{"status":"running"}' backend)" ]
 
+# start writes both Sparkle preferences and is idempotent once they are false.
+(
+  automatic_checks=1
+  automatic_install=1
+  writes=""
+  desktop_preference_value() {
+    case "$1" in
+      SUEnableAutomaticChecks) printf '%s\n' "$automatic_checks" ;;
+      SUAutomaticallyUpdate) printf '%s\n' "$automatic_install" ;;
+    esac
+  }
+  write_false_desktop_preference() {
+    writes="${writes}$1 "
+    case "$1" in
+      SUEnableAutomaticChecks) automatic_checks=0 ;;
+      SUAutomaticallyUpdate) automatic_install=0 ;;
+    esac
+  }
+  disable_desktop_auto_updates
+  [ "$AUTO_UPDATE_CHANGED" = yes ]
+  [ "$writes" = "SUEnableAutomaticChecks SUAutomaticallyUpdate " ]
+  writes=""
+  disable_desktop_auto_updates
+  [ "$AUTO_UPDATE_CHANGED" = no ]
+  [ -z "$writes" ]
+)
+
+# Subsequent command tests isolate lifecycle behavior from the real preferences.
+disable_desktop_auto_updates() { AUTO_UPDATE_CHANGED=no; }
+
 # Reuse settings must target the GUI bootstrap domain even when invoked by SSH.
 (
   observed=""
@@ -89,6 +119,7 @@ assert_classification() {
   DESKTOP_COMPATIBILITY="$5"
   MANAGED_VERSION="$6"
   RUNNING_VERSION="$7"
+  DESKTOP_AUTO_UPDATES=disabled
   expected_state="$8"
   classify_state
   [ "$OVERALL_STATE" = "$expected_state" ] || {
@@ -149,6 +180,7 @@ if printf '%s\n' "$missing_desktop_output" | grep -F "brew reinstall" >/dev/null
 # A healthy state must not invent recovery work.
 healthy_status_output="$( (
   DESKTOP_COMPATIBILITY=verified
+  DESKTOP_AUTO_UPDATES=disabled
   MANAGED_VERSION=0.153.4
   RUNNING_VERSION=0.153.4
   CLI_VERSION=0.153.4
@@ -161,6 +193,23 @@ healthy_status_output="$( (
 ) )"
 printf '%s\n' "$healthy_status_output" | grep -F -- "- none" >/dev/null
 printf '%s\n' "$healthy_status_output" | grep -F "recommended recovery: none" >/dev/null
+
+# status reports update preferences and directs repair through start.
+auto_update_status_output="$( (
+  DESKTOP_COMPATIBILITY=verified
+  DESKTOP_AUTO_UPDATES=not-disabled
+  MANAGED_VERSION=0.153.4
+  RUNNING_VERSION=0.153.4
+  CLI_VERSION=0.153.4
+  DAEMON_OWNERSHIP=managed
+  UPDATER_STATE=stopped
+  REUSE_ENABLED=yes
+  CHATGPT_PIDS=42
+  DESKTOP_BACKEND=managed-daemon
+  print_issues_and_recovery
+) )"
+printf '%s\n' "$auto_update_status_output" | grep -F "ChatGPT Desktop automatic updates are not disabled" >/dev/null
+printf '%s\n' "$auto_update_status_output" | grep -F "1. codex-remote start" >/dev/null
 
 # The internal attach stage must refuse an unmanaged app-server instead of guessing.
 set +e
@@ -214,7 +263,22 @@ printf '%s\n' "$missing_backend_error" | grep -F "daemon is not managed" >/dev/n
   start_managed_reuse no
 )
 
-# start is also idempotent: a healthy session is not stopped or reattached.
+# A failed preference write blocks start and prints both manual recovery commands.
+set +e
+auto_update_error="$( (
+  require_macos() { :; }
+  disable_desktop_auto_updates() { return 1; }
+  CHATGPT_APP=/tmp
+  command_start
+) 2>&1)"
+auto_update_status=$?
+set -e
+[ "$auto_update_status" -ne 0 ]
+printf '%s\n' "$auto_update_error" | grep -F "failed to disable ChatGPT Desktop automatic updates" >/dev/null
+printf '%s\n' "$auto_update_error" | grep -F "defaults write com.openai.codex SUEnableAutomaticChecks -bool false" >/dev/null
+printf '%s\n' "$auto_update_error" | grep -F "defaults write com.openai.codex SUAutomaticallyUpdate -bool false" >/dev/null
+
+# A healthy start does not stop or reattach the managed runtime.
 (
   require_macos() { :; }
   collect_state() {

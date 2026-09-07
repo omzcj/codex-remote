@@ -23,7 +23,7 @@ curl -fsSL https://chatgpt.com/codex/install.sh | sh
 ```sh
 codex-remote                    # 等价于 status，只读
 codex-remote status             # 查看版本、进程、socket、ownership 和 Desktop 后端
-codex-remote start              # 检查、修复安全的运行时问题、打开并验证 Desktop
+codex-remote start              # 禁用自动更新、修复运行时问题、打开并验证 Desktop
 codex-remote stop               # 完全关闭 Desktop、复用环境和 shared daemon
 codex-remote restart            # 强制 stop 后重新 start
 codex-remote update check       # 只检查 standalone Codex 更新
@@ -46,6 +46,11 @@ reuse 环境变量始终读写登录用户的 `gui/<uid>` launchd bootstrap doma
 启动时间、可执行文件和 control socket ownership 后，自动清理安全的 unmanaged
 app-server、stale runtime、残留 updater 或 unready daemon，再启动 managed daemon，打开
 ChatGPT 并等待它真正接入 managed daemon。可自动处理的动作会逐项记录。
+
+每次 `start` 都会检查并将 ChatGPT 的 Sparkle 首选项 `SUEnableAutomaticChecks` 和
+`SUAutomaticallyUpdate` 写为 `false`，然后验证设置。这样即使应用重新打开过自动更新，
+日常启动也会恢复固定版本策略；`status` 会单独显示该设置是否已禁用。写入失败时工具不会
+继续启动，而会输出两条可手动执行的 `defaults write` 命令。
 
 安装缺失、Desktop 版本不兼容、Codex CLI 与 managed Codex 版本错位，以及无法证明身份的
 socket/updater 进程不会被静默修改。`start` 会汇总所有 blocker，显示 PID、可执行文件和

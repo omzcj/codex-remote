@@ -19,6 +19,7 @@ UPDATER_PID_FILE="$DAEMON_DIR/app-server-updater.pid"
 
 CHATGPT_APP="${CODEX_REMOTE_CHATGPT_APP:-/Applications/ChatGPT.app}"
 CHATGPT_EXECUTABLE="$CHATGPT_APP/Contents/MacOS/ChatGPT"
+CHATGPT_DEFAULTS_DOMAIN="${CODEX_REMOTE_CHATGPT_DEFAULTS_DOMAIN:-com.openai.codex}"
 PROCESS_WAIT_SECONDS="${CODEX_REMOTE_PROCESS_WAIT_SECONDS:-20}"
 UPDATER_WAIT_SECONDS="${CODEX_REMOTE_UPDATER_WAIT_SECONDS:-70}"
 ATTACH_WAIT_SECONDS="${CODEX_REMOTE_ATTACH_WAIT_SECONDS:-15}"
@@ -44,6 +45,7 @@ REUSE_ENABLED="no"
 CHATGPT_PIDS=""
 CHATGPT_VERSION=""
 DESKTOP_COMPATIBILITY="missing"
+DESKTOP_AUTO_UPDATES="not-disabled"
 DESKTOP_BACKEND="inactive"
 OVERALL_STATE="disabled"
 DAEMON_VERSION_OUTPUT=""
@@ -269,6 +271,42 @@ desktop_version() {
   /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info_plist" 2>/dev/null
 }
 
+desktop_preference_value() {
+  /usr/bin/defaults read "$CHATGPT_DEFAULTS_DOMAIN" "$1" 2>/dev/null
+}
+
+preference_is_false() {
+  case "$1" in
+    0|false|FALSE|no|NO) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+desktop_auto_updates_disabled() {
+  automatic_checks="$(desktop_preference_value SUEnableAutomaticChecks || true)"
+  automatic_install="$(desktop_preference_value SUAutomaticallyUpdate || true)"
+  preference_is_false "$automatic_checks" && preference_is_false "$automatic_install"
+}
+
+write_false_desktop_preference() {
+  /usr/bin/defaults write "$CHATGPT_DEFAULTS_DOMAIN" "$1" -bool false
+}
+
+disable_desktop_auto_updates() {
+  AUTO_UPDATE_CHANGED=no
+  for preference_key in SUEnableAutomaticChecks SUAutomaticallyUpdate; do
+    preference_value="$(desktop_preference_value "$preference_key" || true)"
+    if ! preference_is_false "$preference_value"; then
+      write_false_desktop_preference "$preference_key" || return 1
+      AUTO_UPDATE_CHANGED=yes
+    fi
+  done
+  desktop_auto_updates_disabled || return 1
+  if [ "$AUTO_UPDATE_CHANGED" = "yes" ]; then
+    log "disabled ChatGPT automatic update checks and installation"
+  fi
+}
+
 desktop_reuses_daemon() {
   [ "$DAEMON_OWNERSHIP" = "managed" ] || return 1
   [ -n "$SERVER_PID" ] && [ -n "$CHATGPT_PIDS" ] || return 1
@@ -367,6 +405,7 @@ collect_state() {
   CHATGPT_PIDS=""
   CHATGPT_VERSION=""
   DESKTOP_COMPATIBILITY="missing"
+  DESKTOP_AUTO_UPDATES="not-disabled"
   DESKTOP_BACKEND="inactive"
   OVERALL_STATE="disabled"
   DAEMON_VERSION_OUTPUT=""
@@ -384,6 +423,7 @@ collect_state() {
   else
     DESKTOP_COMPATIBILITY="unverified"
   fi
+  if desktop_auto_updates_disabled; then DESKTOP_AUTO_UPDATES="disabled"; fi
   CHATGPT_PIDS="$(chatgpt_pids || true)"
 
   SERVER_PID="$(single_socket_owner_pid || true)"
@@ -476,6 +516,9 @@ classify_state() {
     OVERALL_STATE="healthy"
   else
     OVERALL_STATE="not-attached"
+  fi
+  if [ "$DESKTOP_COMPATIBILITY" != "missing" ] && [ "$DESKTOP_AUTO_UPDATES" != "disabled" ]; then
+    OVERALL_STATE="automatic-updates-not-disabled"
   fi
   if [ "$REUSE_ENABLED" = "yes" ] && [ "$DESKTOP_COMPATIBILITY" = "unverified" ]; then
     OVERALL_STATE="unsupported-desktop"
@@ -581,6 +624,7 @@ print_status() {
   printf 'state: %s\n' "$OVERALL_STATE"
   printf 'Desktop version: %s\n' "${CHATGPT_VERSION:-not installed}"
   printf 'Desktop compatibility: %s\n' "$DESKTOP_COMPATIBILITY"
+  printf 'Desktop automatic updates: %s\n' "$DESKTOP_AUTO_UPDATES"
   printf 'reuse environment: %s\n' "$REUSE_ENABLED"
   printf 'Codex CLI: %s%s\n' "${CLI_VERSION:-not found}" "${CODEX_BIN:+ ($CODEX_BIN)}"
   printf 'managed Codex: %s%s\n' "${MANAGED_VERSION:-not installed}" "${MANAGED_CODEX_BIN:+ ($MANAGED_CODEX_BIN)}"
@@ -628,6 +672,11 @@ print_issues_and_recovery() {
       STATUS_NEEDS_START=yes
       ;;
   esac
+
+  if [ "$DESKTOP_COMPATIBILITY" != "missing" ] && [ "$DESKTOP_AUTO_UPDATES" != "disabled" ]; then
+    print_issue "ChatGPT Desktop automatic updates are not disabled"
+    STATUS_NEEDS_START=yes
+  fi
 
   if [ -z "$MANAGED_VERSION" ]; then
     print_issue "official standalone managed Codex is not installed"
@@ -862,6 +911,16 @@ command_start() {
   allow_unverified=no
   if [ "${1:-}" = "--force" ]; then allow_unverified=yes; shift; fi
   [ "$#" -eq 0 ] || fail "start accepts only --force"
+  require_macos
+  if [ -d "$CHATGPT_APP" ] && ! disable_desktop_auto_updates; then
+    printf '%s start: blocked\n' "$PROGRAM_NAME" >&2
+    printf 'issues:\n- failed to disable ChatGPT Desktop automatic updates\n' >&2
+    printf 'required action:\n' >&2
+    printf '1. defaults write %s SUEnableAutomaticChecks -bool false\n' "$CHATGPT_DEFAULTS_DOMAIN" >&2
+    printf '2. defaults write %s SUAutomaticallyUpdate -bool false\n' "$CHATGPT_DEFAULTS_DOMAIN" >&2
+    printf '3. %s start\n' "$PROGRAM_NAME" >&2
+    return 1
+  fi
   start_preflight "$allow_unverified" || return 1
 
   if [ "$OVERALL_STATE" = "healthy" ]; then
