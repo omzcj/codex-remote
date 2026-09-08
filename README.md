@@ -37,6 +37,10 @@ codex-remote update 0.153.4     # 安装或回滚到指定版本
 `managedCodexPath`、control socket、官方可执行文件和 `--remote-control` 进程参数确认
 ownership，避免对正常复用产生假阳性。无参数运行不会修改系统状态。
 
+交互式终端中的 `status` 会用红色突出异常、黄色标记停止或等待状态，并只对关键健康状态
+使用绿色。通过管道、重定向或非 TTY SSH 执行时保持纯文本；设置 `NO_COLOR` 或使用
+`TERM=dumb` 也会关闭颜色。远程查看颜色时可使用 `ssh -t HOST codex-remote status`。
+
 reuse 环境变量始终读写登录用户的 `gui/<uid>` launchd bootstrap domain；从 SSH 执行时
 会通过一次性 LaunchAgent 完成写入，随后立即卸载。因此本地终端、Desktop 和 SSH 的行为
 一致，远程执行 `start` 后新启动的 ChatGPT 也能继承配置，且不需要 sudo。

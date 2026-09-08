@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.08.1"
+PROGRAM_VERSION="2026.09.08.2"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
 LATEST_RELEASE_URL="https://releases.openai.com/codex/channels/latest"
@@ -49,6 +49,20 @@ DESKTOP_AUTO_UPDATES="not-disabled"
 DESKTOP_BACKEND="inactive"
 OVERALL_STATE="disabled"
 DAEMON_VERSION_OUTPUT=""
+COLOR_RED=""
+COLOR_YELLOW=""
+COLOR_GREEN=""
+COLOR_RESET=""
+
+init_colors() {
+  [ -t 1 ] || return 0
+  [ "${TERM:-dumb}" != "dumb" ] || return 0
+  [ -z "${NO_COLOR+x}" ] || return 0
+  COLOR_RED="$(printf '\033[31m')"
+  COLOR_YELLOW="$(printf '\033[33m')"
+  COLOR_GREEN="$(printf '\033[32m')"
+  COLOR_RESET="$(printf '\033[0m')"
+}
 
 log() {
   printf '%s %s\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -617,30 +631,86 @@ disable_reuse() {
 }
 
 print_status() {
-  printf 'codex-remote: %s\n' "$PROGRAM_VERSION"
-  printf 'state: %s\n' "$OVERALL_STATE"
-  printf 'Desktop version: %s\n' "${CHATGPT_VERSION:-not installed}"
-  printf 'Desktop compatibility: %s\n' "$DESKTOP_COMPATIBILITY"
-  printf 'Desktop automatic updates: %s\n' "$DESKTOP_AUTO_UPDATES"
-  printf 'reuse environment: %s\n' "$REUSE_ENABLED"
-  printf 'Codex CLI: %s%s\n' "${CLI_VERSION:-not found}" "${CODEX_BIN:+ ($CODEX_BIN)}"
-  printf 'managed Codex: %s%s\n' "${MANAGED_VERSION:-not installed}" "${MANAGED_CODEX_BIN:+ ($MANAGED_CODEX_BIN)}"
-  printf 'daemon probe: %s\n' "$DAEMON_PROBE"
-  printf 'daemon backend: %s\n' "${DAEMON_BACKEND:-none}"
-  printf 'daemon ownership: %s\n' "$DAEMON_OWNERSHIP"
-  printf 'running app-server: %s\n' "${RUNNING_VERSION:-not running}"
-  printf 'socket owner: %s\n' "${SERVER_PID:-none}"
+  case "$OVERALL_STATE" in
+    healthy) overall_level=good ;;
+    stopped|disabled|waiting-for-desktop|starting-unready) overall_level=warning ;;
+    *) overall_level=error ;;
+  esac
+  case "$DESKTOP_COMPATIBILITY" in verified) desktop_level=good ;; *) desktop_level=error ;; esac
+  case "$DESKTOP_AUTO_UPDATES" in disabled) updates_level=good ;; *) updates_level=error ;; esac
+  case "$REUSE_ENABLED" in yes) reuse_level=good ;; *) reuse_level=warning ;; esac
+  cli_level=neutral
+  managed_level=neutral
+  if [ -z "$CLI_VERSION" ] || [ -z "$MANAGED_VERSION" ]; then
+    [ -n "$CLI_VERSION" ] || cli_level=error
+    [ -n "$MANAGED_VERSION" ] || managed_level=error
+  elif [ "$CLI_VERSION" != "$MANAGED_VERSION" ]; then
+    cli_level=error
+    managed_level=error
+  fi
+  if [ "$DAEMON_PROBE" = "ready" ]; then
+    probe_level=good
+  elif [ "$DAEMON_OWNERSHIP" = "stopped" ]; then
+    probe_level=warning
+  else
+    probe_level=error
+  fi
+  case "$DAEMON_OWNERSHIP" in managed) ownership_level=good ;; stopped) ownership_level=warning ;; *) ownership_level=error ;; esac
+  running_level=neutral
+  if [ -z "$RUNNING_VERSION" ]; then
+    running_level=warning
+  elif [ -n "$MANAGED_VERSION" ] && [ "$RUNNING_VERSION" != "$MANAGED_VERSION" ]; then
+    running_level=error
+  fi
+  case "$UPDATER_STATE" in stopped) updater_level=good ;; invalid|ambiguous) updater_level=error ;; *) updater_level=warning ;; esac
+  if [ -n "$CHATGPT_PIDS" ]; then chatgpt_level=good; else chatgpt_level=warning; fi
+  case "$DESKTOP_BACKEND" in managed-daemon) backend_level=good ;; inactive) backend_level=warning ;; *) backend_level=error ;; esac
+
+  print_status_field "codex-remote" "$PROGRAM_VERSION" neutral
+  print_status_field "state" "$OVERALL_STATE" "$overall_level"
+  print_status_field "Desktop version" "${CHATGPT_VERSION:-not installed}" neutral
+  print_status_field "Desktop compatibility" "$DESKTOP_COMPATIBILITY" "$desktop_level"
+  print_status_field "Desktop automatic updates" "$DESKTOP_AUTO_UPDATES" "$updates_level"
+  print_status_field "reuse environment" "$REUSE_ENABLED" "$reuse_level"
+  print_status_field "Codex CLI" "${CLI_VERSION:-not found}${CODEX_BIN:+ ($CODEX_BIN)}" "$cli_level"
+  print_status_field "managed Codex" "${MANAGED_VERSION:-not installed}${MANAGED_CODEX_BIN:+ ($MANAGED_CODEX_BIN)}" "$managed_level"
+  print_status_field "daemon probe" "$DAEMON_PROBE" "$probe_level"
+  print_status_field "daemon backend" "${DAEMON_BACKEND:-none}" neutral
+  print_status_field "daemon ownership" "$DAEMON_OWNERSHIP" "$ownership_level"
+  print_status_field "running app-server" "${RUNNING_VERSION:-not running}" "$running_level"
+  if [ -n "$SERVER_PID" ]; then socket_level=neutral; else socket_level=warning; fi
+  print_status_field "socket owner" "${SERVER_PID:-none}" "$socket_level"
   if [ -n "$SERVER_COMMAND" ]; then printf 'socket command: %s\n' "$SERVER_COMMAND"; fi
   if [ -n "$SERVER_EXECUTABLE" ]; then printf 'socket executable: %s\n' "$SERVER_EXECUTABLE"; fi
-  printf 'updater: %s%s\n' "$UPDATER_STATE" "${UPDATER_PID:+ (PID $UPDATER_PID)}"
-  printf 'ChatGPT: %s\n' "$(if [ -n "$CHATGPT_PIDS" ]; then printf 'running (%s)' "$(printf '%s' "$CHATGPT_PIDS" | /usr/bin/tr '\n' ' ')"; else printf 'not running'; fi)"
-  printf 'Desktop backend: %s\n' "$DESKTOP_BACKEND"
+  print_status_field "updater" "$UPDATER_STATE${UPDATER_PID:+ (PID $UPDATER_PID)}" "$updater_level"
+  if [ -n "$CHATGPT_PIDS" ]; then
+    chatgpt_value="running ($(printf '%s' "$CHATGPT_PIDS" | /usr/bin/tr '\n' ' '))"
+  else
+    chatgpt_value="not running"
+  fi
+  print_status_field "ChatGPT" "$chatgpt_value" "$chatgpt_level"
+  print_status_field "Desktop backend" "$DESKTOP_BACKEND" "$backend_level"
   print_issues
+}
+
+print_status_field() {
+  status_label="$1"
+  status_value="$2"
+  status_level="$3"
+  case "$status_level" in
+    error) status_color="$COLOR_RED" ;;
+    warning) status_color="$COLOR_YELLOW" ;;
+    good) status_color="$COLOR_GREEN" ;;
+    *) status_color="" ;;
+  esac
+  status_reset=""
+  [ -z "$status_color" ] || status_reset="$COLOR_RESET"
+  printf '%s: %s%s%s\n' "$status_label" "$status_color" "$status_value" "$status_reset"
 }
 
 print_issue() {
   STATUS_ISSUE_COUNT=$((STATUS_ISSUE_COUNT + 1))
-  printf -- '- %s\n' "$1"
+  printf '%s- %s%s\n' "$COLOR_RED" "$1" "$COLOR_RESET"
 }
 
 print_issues() {
@@ -702,7 +772,7 @@ print_issues() {
   fi
 
   if [ "$STATUS_ISSUE_COUNT" -eq 0 ]; then
-    printf '%s\n' '- none'
+    printf '%s- none%s\n' "$COLOR_GREEN" "$COLOR_RESET"
   fi
 }
 
@@ -1059,6 +1129,7 @@ command_update() {
 }
 
 main() {
+  init_colors
   command_name="${1:-status}"
   if [ "$#" -gt 0 ]; then shift; fi
   case "$command_name" in

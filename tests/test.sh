@@ -34,6 +34,27 @@ export CODEX_REMOTE_SOURCE_ONLY
 [ "$(json_string_field '{"status":"running","backend":"pid"}' backend)" = "pid" ]
 [ -z "$(json_string_field '{"status":"running"}' backend)" ]
 
+# Color is applied only by the renderer; neutral fields remain byte-for-byte plain.
+(
+  COLOR_RED='<red>'
+  COLOR_YELLOW='<yellow>'
+  COLOR_GREEN='<green>'
+  COLOR_RESET='</color>'
+  [ "$(print_status_field state unmanaged error)" = 'state: <red>unmanaged</color>' ]
+  [ "$(print_status_field state stopped warning)" = 'state: <yellow>stopped</color>' ]
+  [ "$(print_status_field state healthy good)" = 'state: <green>healthy</color>' ]
+  [ "$(print_status_field codex-remote 2026.09.08.2 neutral)" = 'codex-remote: 2026.09.08.2' ]
+)
+
+# Issue lines are highlighted while an empty issue list is green.
+(
+  COLOR_RED='<red>'
+  COLOR_GREEN='<green>'
+  COLOR_RESET='</color>'
+  STATUS_ISSUE_COUNT=0
+  [ "$(print_issue broken)" = '<red>- broken</color>' ]
+)
+
 # start writes both Sparkle preferences and is idempotent once they are false.
 (
   automatic_checks=1
@@ -295,32 +316,42 @@ printf '%s\n' "$auto_update_error" | grep -F "failed to disable ChatGPT Desktop 
 # start repairs a safely identified unmanaged runtime, enables reuse, and verifies it.
 (
   order=""
-  collect_count=0
+  runtime_phase=unmanaged
   require_macos() { :; }
   collect_state() {
-    collect_count=$((collect_count + 1))
     DESKTOP_COMPATIBILITY=verified
     MANAGED_VERSION=0.153.4
     CLI_VERSION=0.153.4
     UPDATER_STATE=stopped
-    if [ "$collect_count" -eq 1 ]; then
-      DAEMON_OWNERSHIP=unmanaged
-      SERVER_PID=42
-      OVERALL_STATE=unmanaged
-      REUSE_ENABLED=no
-      DESKTOP_BACKEND=inactive
-    else
-      DAEMON_OWNERSHIP=managed
-      REUSE_ENABLED=yes
-      DESKTOP_BACKEND=managed-daemon
-      OVERALL_STATE=healthy
-    fi
+    case "$runtime_phase" in
+      unmanaged)
+        DAEMON_OWNERSHIP=unmanaged
+        SERVER_PID=42
+        OVERALL_STATE=unmanaged
+        REUSE_ENABLED=no
+        DESKTOP_BACKEND=inactive
+        ;;
+      stopped)
+        DAEMON_OWNERSHIP=stopped
+        SERVER_PID=""
+        OVERALL_STATE=stopped
+        REUSE_ENABLED=no
+        DESKTOP_BACKEND=inactive
+        ;;
+      managed)
+        DAEMON_OWNERSHIP=managed
+        SERVER_PID=42
+        REUSE_ENABLED=yes
+        DESKTOP_BACKEND=managed-daemon
+        OVERALL_STATE=healthy
+        ;;
+    esac
   }
   socket_owner_pids() { printf '42\n'; }
   process_start_time() { printf 'Sat Sep  6 12:00:00 2026\n'; }
   is_safe_app_server_pid() { [ "$1" = 42 ]; }
-  command_stop() { order="${order}stop "; }
-  start_managed_reuse() { order="${order}attach "; }
+  command_stop() { order="${order}stop "; runtime_phase=stopped; }
+  start_managed_reuse() { order="${order}attach "; runtime_phase=managed; }
   command_start
   [ "$order" = "stop attach " ]
 )
