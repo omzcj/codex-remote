@@ -59,7 +59,8 @@ daemon/Desktop 重试，最终只返回成功或一个无法安全自动处理�
 相比会被应用运行期间重新写回的 `SUEnableAutomaticChecks` 和 `SUAutomaticallyUpdate`
 首选项，它是自动更新是否真正被禁用的权威状态。工具仍会将这两个旧首选项写为 `false`
 作为辅助防线。如果正在运行的 ChatGPT 尚未继承 updater 门控，`start` 会自动关闭并重新
-打开一次，然后同时验证进程环境、daemon ownership 和 Desktop attachment。`stop` 不会
+打开一次；已经健康的 managed daemon 不会因此重启。随后工具会同时验证进程环境、
+daemon ownership 和 Desktop attachment。`stop` 不会
 清除 updater 门控，因此以后直接打开 ChatGPT 也会保持禁用自动更新。
 
 ChatGPT 缺失或版本不是 `26.818.61809` 时，`start` 会通过

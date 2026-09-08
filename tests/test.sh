@@ -43,7 +43,7 @@ export CODEX_REMOTE_SOURCE_ONLY
   [ "$(print_status_field state unmanaged error)" = 'state: <red>unmanaged</color>' ]
   [ "$(print_status_field state stopped warning)" = 'state: <yellow>stopped</color>' ]
   [ "$(print_status_field state healthy good)" = 'state: <green>healthy</color>' ]
-  [ "$(print_status_field codex-remote 2026.09.08.5 neutral)" = 'codex-remote: 2026.09.08.5' ]
+  [ "$(print_status_field codex-remote 2026.09.08.6 neutral)" = 'codex-remote: 2026.09.08.6' ]
 )
 
 # Issue lines are highlighted while an empty issue list is green.

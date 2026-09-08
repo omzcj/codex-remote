@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.08.5"
+PROGRAM_VERSION="2026.09.08.6"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 SPARKLE_ENV_NAME="CODEX_SPARKLE_ENABLED"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
@@ -934,9 +934,6 @@ command_start() {
   case "$UPDATER_STATE" in
     running|stale|orphan) needs_stop=yes ;;
   esac
-  if [ "$DESKTOP_AUTO_UPDATES" = "restart-required" ]; then
-    needs_stop=yes
-  fi
   if [ "$needs_stop" = "yes" ]; then
     log "repairing shared daemon runtime before start"
     command_stop
