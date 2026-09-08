@@ -43,7 +43,7 @@ export CODEX_REMOTE_SOURCE_ONLY
   [ "$(print_status_field state unmanaged error)" = 'state: <red>unmanaged</color>' ]
   [ "$(print_status_field state stopped warning)" = 'state: <yellow>stopped</color>' ]
   [ "$(print_status_field state healthy good)" = 'state: <green>healthy</color>' ]
-  [ "$(print_status_field codex-remote 2026.09.08.2 neutral)" = 'codex-remote: 2026.09.08.2' ]
+  [ "$(print_status_field codex-remote 2026.09.08.3 neutral)" = 'codex-remote: 2026.09.08.3' ]
 )
 
 # Issue lines are highlighted while an empty issue list is green.
@@ -59,7 +59,15 @@ export CODEX_REMOTE_SOURCE_ONLY
 (
   automatic_checks=1
   automatic_install=1
+  sparkle_environment=""
   writes=""
+  gui_launchctl() {
+    case "$1" in
+      getenv) printf '%s\n' "$sparkle_environment" ;;
+      setenv) sparkle_environment="$3" ;;
+      *) return 1 ;;
+    esac
+  }
   desktop_preference_value() {
     case "$1" in
       SUEnableAutomaticChecks) printf '%s\n' "$automatic_checks" ;;
@@ -75,6 +83,7 @@ export CODEX_REMOTE_SOURCE_ONLY
   }
   disable_desktop_auto_updates
   [ "$AUTO_UPDATE_CHANGED" = yes ]
+  [ "$sparkle_environment" = false ]
   [ "$writes" = "SUEnableAutomaticChecks SUAutomaticallyUpdate " ]
   writes=""
   disable_desktop_auto_updates

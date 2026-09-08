@@ -3,8 +3,9 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.08.2"
+PROGRAM_VERSION="2026.09.08.3"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
+SPARKLE_ENV_NAME="CODEX_SPARKLE_ENABLED"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
 LATEST_RELEASE_URL="https://releases.openai.com/codex/channels/latest"
 SUPPORTED_DESKTOP_VERSION="26.818.61809"
@@ -46,6 +47,7 @@ CHATGPT_PIDS=""
 CHATGPT_VERSION=""
 DESKTOP_COMPATIBILITY="missing"
 DESKTOP_AUTO_UPDATES="not-disabled"
+SPARKLE_ENV_VALUE=""
 DESKTOP_BACKEND="inactive"
 OVERALL_STATE="disabled"
 DAEMON_VERSION_OUTPUT=""
@@ -237,6 +239,21 @@ process_command() {
   /bin/ps -p "$1" -ww -o command= 2>/dev/null
 }
 
+process_has_environment_value() {
+  environment_pid="$1"
+  environment_name="$2"
+  environment_value="$3"
+  /bin/ps eww -p "$environment_pid" -o command= 2>/dev/null | \
+    /usr/bin/awk -v expected="$environment_name=$environment_value" '
+      {
+        for (field = 1; field <= NF; field++) {
+          if ($field == expected) found = 1
+        }
+      }
+      END { exit(found ? 0 : 1) }
+    '
+}
+
 process_start_time() {
   /bin/ps -p "$1" -o lstart= 2>/dev/null | \
     /usr/bin/sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
@@ -296,9 +313,15 @@ preference_is_false() {
 }
 
 desktop_auto_updates_disabled() {
-  automatic_checks="$(desktop_preference_value SUEnableAutomaticChecks || true)"
-  automatic_install="$(desktop_preference_value SUAutomaticallyUpdate || true)"
-  preference_is_false "$automatic_checks" && preference_is_false "$automatic_install"
+  [ "$SPARKLE_ENV_VALUE" = "false" ] || return 1
+  [ -z "$CHATGPT_PIDS" ] && return 0
+  for process_id in $CHATGPT_PIDS; do
+    process_has_environment_value "$process_id" "$SPARKLE_ENV_NAME" false || return 1
+  done
+}
+
+desktop_auto_update_policy_configured() {
+  [ "$(gui_launchctl getenv "$SPARKLE_ENV_NAME" 2>/dev/null || true)" = "false" ]
 }
 
 write_false_desktop_preference() {
@@ -307,6 +330,10 @@ write_false_desktop_preference() {
 
 disable_desktop_auto_updates() {
   AUTO_UPDATE_CHANGED=no
+  if ! desktop_auto_update_policy_configured; then
+    gui_launchctl setenv "$SPARKLE_ENV_NAME" false || return 1
+    AUTO_UPDATE_CHANGED=yes
+  fi
   for preference_key in SUEnableAutomaticChecks SUAutomaticallyUpdate; do
     preference_value="$(desktop_preference_value "$preference_key" || true)"
     if ! preference_is_false "$preference_value"; then
@@ -314,9 +341,9 @@ disable_desktop_auto_updates() {
       AUTO_UPDATE_CHANGED=yes
     fi
   done
-  desktop_auto_updates_disabled || return 1
+  desktop_auto_update_policy_configured || return 1
   if [ "$AUTO_UPDATE_CHANGED" = "yes" ]; then
-    log "disabled ChatGPT automatic update checks and installation"
+    log "disabled the ChatGPT updater for future Desktop launches"
   fi
 }
 
@@ -425,12 +452,14 @@ collect_state() {
   CHATGPT_VERSION=""
   DESKTOP_COMPATIBILITY="missing"
   DESKTOP_AUTO_UPDATES="not-disabled"
+  SPARKLE_ENV_VALUE=""
   DESKTOP_BACKEND="inactive"
   OVERALL_STATE="disabled"
   DAEMON_VERSION_OUTPUT=""
 
   reuse_value="$(gui_launchctl getenv "$ENV_NAME" 2>/dev/null || true)"
   if [ "$reuse_value" = "1" ]; then REUSE_ENABLED="yes"; else REUSE_ENABLED="no"; fi
+  SPARKLE_ENV_VALUE="$(gui_launchctl getenv "$SPARKLE_ENV_NAME" 2>/dev/null || true)"
   if find_codex; then CLI_VERSION="$(codex_version "$CODEX_BIN" || true)"; fi
   if find_managed_codex; then MANAGED_VERSION="$(codex_version "$MANAGED_CODEX_BIN" || true)"; fi
 
@@ -442,8 +471,12 @@ collect_state() {
   else
     DESKTOP_COMPATIBILITY="unverified"
   fi
-  if desktop_auto_updates_disabled; then DESKTOP_AUTO_UPDATES="disabled"; fi
   CHATGPT_PIDS="$(chatgpt_pids || true)"
+  if desktop_auto_updates_disabled; then
+    DESKTOP_AUTO_UPDATES="disabled"
+  elif [ "$SPARKLE_ENV_VALUE" = "false" ] && [ -n "$CHATGPT_PIDS" ]; then
+    DESKTOP_AUTO_UPDATES="restart-required"
+  fi
 
   SERVER_PID="$(single_socket_owner_pid || true)"
   probe_bin="$CODEX_BIN"
@@ -637,7 +670,8 @@ print_status() {
     *) overall_level=error ;;
   esac
   case "$DESKTOP_COMPATIBILITY" in verified) desktop_level=good ;; *) desktop_level=error ;; esac
-  case "$DESKTOP_AUTO_UPDATES" in disabled) updates_level=good ;; *) updates_level=error ;; esac
+  case "$DESKTOP_AUTO_UPDATES" in disabled) updates_level=good ;; restart-required) updates_level=warning ;; *) updates_level=error ;; esac
+  case "$SPARKLE_ENV_VALUE" in false) sparkle_level=good ;; *) sparkle_level=error ;; esac
   case "$REUSE_ENABLED" in yes) reuse_level=good ;; *) reuse_level=warning ;; esac
   cli_level=neutral
   managed_level=neutral
@@ -671,6 +705,7 @@ print_status() {
   print_status_field "Desktop version" "${CHATGPT_VERSION:-not installed}" neutral
   print_status_field "Desktop compatibility" "$DESKTOP_COMPATIBILITY" "$desktop_level"
   print_status_field "Desktop automatic updates" "$DESKTOP_AUTO_UPDATES" "$updates_level"
+  print_status_field "Desktop updater gate" "$SPARKLE_ENV_NAME=${SPARKLE_ENV_VALUE:-not set}" "$sparkle_level"
   print_status_field "reuse environment" "$REUSE_ENABLED" "$reuse_level"
   print_status_field "Codex CLI" "${CLI_VERSION:-not found}${CODEX_BIN:+ ($CODEX_BIN)}" "$cli_level"
   print_status_field "managed Codex" "${MANAGED_VERSION:-not installed}${MANAGED_CODEX_BIN:+ ($MANAGED_CODEX_BIN)}" "$managed_level"
@@ -726,8 +761,16 @@ print_issues() {
       ;;
   esac
 
-  if [ "$DESKTOP_COMPATIBILITY" != "missing" ] && [ "$DESKTOP_AUTO_UPDATES" != "disabled" ]; then
-    print_issue "ChatGPT Desktop automatic updates are not disabled"
+  if [ "$DESKTOP_COMPATIBILITY" != "missing" ]; then
+    case "$DESKTOP_AUTO_UPDATES" in
+      restart-required)
+        print_issue "ChatGPT Desktop must restart to inherit $SPARKLE_ENV_NAME=false"
+        ;;
+      disabled) ;;
+      *)
+        print_issue "ChatGPT Desktop automatic updates are not disabled"
+        ;;
+    esac
   fi
 
   if [ -z "$MANAGED_VERSION" ]; then
@@ -891,6 +934,9 @@ command_start() {
   case "$UPDATER_STATE" in
     running|stale|orphan) needs_stop=yes ;;
   esac
+  if [ "$DESKTOP_AUTO_UPDATES" = "restart-required" ]; then
+    needs_stop=yes
+  fi
   if [ "$needs_stop" = "yes" ]; then
     log "repairing shared daemon runtime before start"
     command_stop
@@ -901,8 +947,8 @@ command_start() {
   fi
 
   start_managed_reuse
-  # ChatGPT may rewrite Sparkle preferences while launching. Enforce the pinned
-  # policy again after attachment, then include it in final state verification.
+  # Keep the legacy Sparkle preferences false as a secondary defense. The
+  # authoritative check is the updater gate inherited by the Desktop process.
   ensure_desktop_auto_updates_disabled || return 1
   collect_state
   [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "start verification found a non-managed daemon"

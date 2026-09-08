@@ -52,10 +52,13 @@ runtime、残留 updater 或 unready daemon。它会显式启用 Remote Control�
 daemon，打开 ChatGPT 并等待 Desktop 真正接入。首次接入失败时会自动执行一次有上限的
 daemon/Desktop 重试，最终只返回成功或一个无法安全自动处理的 blocker。
 
-每次 `start` 都会检查并将 ChatGPT 的 Sparkle 首选项 `SUEnableAutomaticChecks` 和
-`SUAutomaticallyUpdate` 写为 `false`。工具会在打开 ChatGPT 前写入一次，并在 Desktop
-成功接入 daemon 后再次写入和验证，覆盖应用启动期间重写首选项的情况。`status` 会单独
-显示该设置是否已禁用；写入失败时工具不会继续，并只报告无法完成的具体设置。
+每次 `start` 都会在登录用户的 GUI launchd 环境中设置
+`CODEX_SPARKLE_ENABLED=false`。这是固定版 Desktop 在创建 updater 前读取的启动门控；
+相比会被应用运行期间重新写回的 `SUEnableAutomaticChecks` 和 `SUAutomaticallyUpdate`
+首选项，它是自动更新是否真正被禁用的权威状态。工具仍会将这两个旧首选项写为 `false`
+作为辅助防线。如果正在运行的 ChatGPT 尚未继承 updater 门控，`start` 会自动关闭并重新
+打开一次，然后同时验证进程环境、daemon ownership 和 Desktop attachment。`stop` 不会
+清除 updater 门控，因此以后直接打开 ChatGPT 也会保持禁用自动更新。
 
 ChatGPT 缺失或版本不是 `26.818.61809` 时，`start` 会通过
 `omzcj/omzcj/chatgpt` 自动安装或恢复固定版本。standalone Codex 缺失，或者 PATH CLI 与
