@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.07.6"
+PROGRAM_VERSION="2026.09.08.1"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
 LATEST_RELEASE_URL="https://releases.openai.com/codex/channels/latest"
@@ -139,10 +139,10 @@ Manage ChatGPT Desktop reuse of the Codex managed app-server daemon.
 Running without a command is read-only and equivalent to status.
 
 Commands:
-  status                 Show all detected issues and an ordered recovery plan
-  start [--force]        Repair safe runtime issues, open Desktop, and verify reuse
+  status                 Show observed state and all detected issues
+  start                  Converge the full runtime, open Desktop, and verify reuse
   stop                   Stop Desktop and the shared daemon runtime
-  restart [--force]      Stop everything, then start and verify it again
+  restart                Ensure stopped, then converge to a verified running state
   update check           Check the latest standalone Codex version
   update latest          Install the latest standalone Codex version
   update VERSION         Install or roll back to a specific standalone version
@@ -152,10 +152,9 @@ Options:
   -h, --help             Show this help
   -v, --version          Show the installed version
 
-start requires the official standalone Codex installation. It never installs,
-bootstraps, or updates Codex implicitly. stop and restart interrupt clients
-connected to the shared daemon, but never delete Codex configuration, auth, or
-thread data.
+start installs or restores the pinned Desktop and official standalone Codex when
+needed. stop and restart interrupt clients connected to the shared daemon, but
+never delete Codex configuration, auth, or thread data.
 EOF
 }
 
@@ -310,13 +309,7 @@ disable_desktop_auto_updates() {
 ensure_desktop_auto_updates_disabled() {
   [ -d "$CHATGPT_APP" ] || return 0
   disable_desktop_auto_updates && return 0
-  printf '%s start: blocked\n' "$PROGRAM_NAME" >&2
-  printf 'issues:\n- failed to disable ChatGPT Desktop automatic updates\n' >&2
-  printf 'required action:\n' >&2
-  printf '1. defaults write %s SUEnableAutomaticChecks -bool false\n' "$CHATGPT_DEFAULTS_DOMAIN" >&2
-  printf '2. defaults write %s SUAutomaticallyUpdate -bool false\n' "$CHATGPT_DEFAULTS_DOMAIN" >&2
-  printf '3. %s start\n' "$PROGRAM_NAME" >&2
-  return 1
+  fail "failed to disable ChatGPT Desktop automatic updates"
 }
 
 desktop_reuses_daemon() {
@@ -614,21 +607,13 @@ open_chatgpt() {
 }
 
 enable_reuse() {
-  gui_launchctl setenv "$ENV_NAME" 1 || {
-    printf '%s: blocked\n' "$PROGRAM_NAME" >&2
-    printf 'issues:\n- failed to set %s in the GUI bootstrap domain\n' "$ENV_NAME" >&2
-    printf 'required action:\n1. Log in to the Mac desktop session\n2. %s start\n' "$PROGRAM_NAME" >&2
-    exit 1
-  }
+  gui_launchctl setenv "$ENV_NAME" 1 || \
+    fail "failed to set $ENV_NAME in the GUI bootstrap domain"
 }
 
 disable_reuse() {
-  gui_launchctl unsetenv "$ENV_NAME" || {
-    printf '%s: blocked\n' "$PROGRAM_NAME" >&2
-    printf 'issues:\n- failed to clear %s in the GUI bootstrap domain\n' "$ENV_NAME" >&2
-    printf 'required action:\n1. Log in to the Mac desktop session\n2. %s stop\n' "$PROGRAM_NAME" >&2
-    exit 1
-  }
+  gui_launchctl unsetenv "$ENV_NAME" || \
+    fail "failed to clear $ENV_NAME in the GUI bootstrap domain"
 }
 
 print_status() {
@@ -650,7 +635,7 @@ print_status() {
   printf 'updater: %s%s\n' "$UPDATER_STATE" "${UPDATER_PID:+ (PID $UPDATER_PID)}"
   printf 'ChatGPT: %s\n' "$(if [ -n "$CHATGPT_PIDS" ]; then printf 'running (%s)' "$(printf '%s' "$CHATGPT_PIDS" | /usr/bin/tr '\n' ' ')"; else printf 'not running'; fi)"
   printf 'Desktop backend: %s\n' "$DESKTOP_BACKEND"
-  print_issues_and_recovery
+  print_issues
 }
 
 print_issue() {
@@ -658,114 +643,67 @@ print_issue() {
   printf -- '- %s\n' "$1"
 }
 
-print_recovery_step() {
-  STATUS_RECOVERY_STEP=$((STATUS_RECOVERY_STEP + 1))
-  printf '%s. %s\n' "$STATUS_RECOVERY_STEP" "$1"
-}
-
-print_issues_and_recovery() {
+print_issues() {
   STATUS_ISSUE_COUNT=0
-  STATUS_RECOVERY_STEP=0
-  STATUS_NEEDS_DESKTOP_INSTALL=no
-  STATUS_NEEDS_DESKTOP_REINSTALL=no
-  STATUS_NEEDS_CODEX_UPDATE=no
-  STATUS_NEEDS_START=no
 
   printf 'issues:\n'
   case "$DESKTOP_COMPATIBILITY" in
     missing)
       print_issue "ChatGPT Desktop is not installed at $CHATGPT_APP"
-      STATUS_NEEDS_DESKTOP_INSTALL=yes
-      STATUS_NEEDS_START=yes
       ;;
     unverified)
       print_issue "ChatGPT Desktop $CHATGPT_VERSION is unverified; supported version is $SUPPORTED_DESKTOP_VERSION"
-      STATUS_NEEDS_DESKTOP_REINSTALL=yes
-      STATUS_NEEDS_START=yes
       ;;
   esac
 
   if [ "$DESKTOP_COMPATIBILITY" != "missing" ] && [ "$DESKTOP_AUTO_UPDATES" != "disabled" ]; then
     print_issue "ChatGPT Desktop automatic updates are not disabled"
-    STATUS_NEEDS_START=yes
   fi
 
   if [ -z "$MANAGED_VERSION" ]; then
     print_issue "official standalone managed Codex is not installed"
-    STATUS_NEEDS_START=yes
   fi
 
   case "$DAEMON_OWNERSHIP" in
     unmanaged)
       print_issue "an unmanaged app-server owns the control socket"
-      STATUS_NEEDS_START=yes
       ;;
     stale-socket)
       print_issue "the app-server control socket is stale"
-      STATUS_NEEDS_START=yes
       ;;
     managed-unready)
       print_issue "the managed daemon has not become ready"
-      STATUS_NEEDS_START=yes
       ;;
     stopped)
       print_issue "the managed daemon is stopped"
-      STATUS_NEEDS_START=yes
       ;;
   esac
 
   if [ -n "$MANAGED_VERSION" ] && [ -n "$RUNNING_VERSION" ] && [ "$MANAGED_VERSION" != "$RUNNING_VERSION" ]; then
     print_issue "running app-server $RUNNING_VERSION differs from installed managed Codex $MANAGED_VERSION"
-    STATUS_NEEDS_START=yes
   fi
 
   if [ "$UPDATER_STATE" != "stopped" ]; then
     print_issue "the standalone updater state is $UPDATER_STATE"
-    STATUS_NEEDS_START=yes
   fi
 
   if [ -n "$CLI_VERSION" ] && [ -n "$MANAGED_VERSION" ] && [ "$CLI_VERSION" != "$MANAGED_VERSION" ]; then
     print_issue "Codex CLI $CLI_VERSION differs from managed Codex $MANAGED_VERSION"
-    STATUS_NEEDS_CODEX_UPDATE=yes
-    STATUS_NEEDS_START=yes
   fi
 
   if [ "$REUSE_ENABLED" = "no" ]; then
     print_issue "Desktop daemon reuse is disabled"
-    STATUS_NEEDS_START=yes
   fi
 
   if [ -z "$CHATGPT_PIDS" ]; then
     print_issue "ChatGPT Desktop is not running"
-    STATUS_NEEDS_START=yes
   elif [ "$DESKTOP_BACKEND" != "managed-daemon" ]; then
     print_issue "ChatGPT Desktop is not attached to the managed daemon"
-    STATUS_NEEDS_START=yes
   fi
 
   if [ "$STATUS_ISSUE_COUNT" -eq 0 ]; then
     printf '%s\n' '- none'
-    printf '%s\n' 'recommended recovery: none'
-    return
   fi
-
-  printf 'recommended recovery:\n'
-  if [ "$STATUS_NEEDS_DESKTOP_INSTALL" = "yes" ]; then
-    print_recovery_step "brew install --cask $PINNED_DESKTOP_CASK"
-  fi
-  if [ "$STATUS_NEEDS_DESKTOP_REINSTALL" = "yes" ]; then
-    print_recovery_step "brew reinstall --cask $PINNED_DESKTOP_CASK"
-  fi
-  if [ -z "$MANAGED_VERSION" ]; then
-    print_recovery_step "curl -fsSL $INSTALL_URL | sh"
-  fi
-  if [ "$STATUS_NEEDS_CODEX_UPDATE" = "yes" ]; then
-    print_recovery_step "$PROGRAM_NAME update latest"
-  fi
-  if [ "$STATUS_NEEDS_START" = "yes" ]; then
-    print_recovery_step "$PROGRAM_NAME start"
-  fi
-  print_recovery_step "$PROGRAM_NAME status"
 }
 
 command_status() {
@@ -789,143 +727,87 @@ brew_available() {
   command -v brew >/dev/null 2>&1
 }
 
-print_start_action() {
-  START_ACTION_NUMBER=$((START_ACTION_NUMBER + 1))
-  printf '%s. %s\n' "$START_ACTION_NUMBER" "$1"
+desktop_cask_installed() {
+  brew list --cask "$PINNED_DESKTOP_CASK" >/dev/null 2>&1
 }
 
-start_preflight() {
-  allow_unverified="$1"
+assert_safe_to_converge() {
   require_macos
   collect_state
 
-  START_BLOCK_COUNT=0
-  START_NEEDS_DESKTOP_INSTALL=no
-  START_NEEDS_DESKTOP_REINSTALL=no
-  START_NEEDS_CODEX_INSTALL=no
-  START_NEEDS_CODEX_UPDATE=no
-  START_UNKNOWN_SOCKET=no
-  START_UNKNOWN_UPDATER=no
-  START_SOCKET_OWNER_PIDS=""
-
-  case "$DESKTOP_COMPATIBILITY" in
-    missing)
-      START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
-      START_NEEDS_DESKTOP_INSTALL=yes
-      ;;
-    unverified)
-      if [ "$allow_unverified" != "yes" ]; then
-        START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
-        START_NEEDS_DESKTOP_REINSTALL=yes
-      fi
-      ;;
-  esac
-
-  if [ -z "$MANAGED_VERSION" ]; then
-    START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
-    START_NEEDS_CODEX_INSTALL=yes
-  fi
-  if [ -n "$CLI_VERSION" ] && [ -n "$MANAGED_VERSION" ] && [ "$CLI_VERSION" != "$MANAGED_VERSION" ]; then
-    START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
-    START_NEEDS_CODEX_UPDATE=yes
+  if [ "$DESKTOP_COMPATIBILITY" != "verified" ] && ! brew_available; then
+    fail "Homebrew is required to install the pinned ChatGPT Desktop"
   fi
 
   if [ "$DAEMON_OWNERSHIP" = "unmanaged" ]; then
-    START_SOCKET_OWNER_PIDS="$(socket_owner_pids || true)"
+    socket_pids="$(socket_owner_pids || true)"
     expected_start=""
     [ -z "$SERVER_PID" ] || expected_start="$(process_start_time "$SERVER_PID" || true)"
     if [ -z "$SERVER_PID" ] || [ -z "$expected_start" ] || \
        ! is_safe_app_server_pid "$SERVER_PID" "$expected_start"; then
-      START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
-      START_UNKNOWN_SOCKET=yes
+      fail "cannot safely replace control-socket owner PID(s): $(printf '%s' "${socket_pids:-unknown}" | /usr/bin/tr '\n' ' ')"
     fi
   fi
 
   case "$UPDATER_STATE" in
-    invalid|ambiguous)
-      START_BLOCK_COUNT=$((START_BLOCK_COUNT + 1))
-      START_UNKNOWN_UPDATER=yes
-      ;;
+    invalid|ambiguous) fail "cannot safely replace standalone updater state: $UPDATER_STATE" ;;
   esac
+}
 
-  [ "$START_BLOCK_COUNT" -gt 0 ] || return 0
-
-  printf '%s start: blocked\n' "$PROGRAM_NAME"
-  printf 'issues:\n'
-  if [ "$START_NEEDS_DESKTOP_INSTALL" = "yes" ]; then
-    printf -- '- ChatGPT Desktop is not installed at %s\n' "$CHATGPT_APP"
-  fi
-  if [ "$START_NEEDS_DESKTOP_REINSTALL" = "yes" ]; then
-    printf -- '- ChatGPT Desktop %s is unverified; supported version is %s\n' \
-      "${CHATGPT_VERSION:-unknown}" "$SUPPORTED_DESKTOP_VERSION"
-  fi
-  if [ "$START_NEEDS_CODEX_INSTALL" = "yes" ]; then
-    printf -- '- official standalone managed Codex is not installed\n'
-  fi
-  if [ "$START_NEEDS_CODEX_UPDATE" = "yes" ]; then
-    printf -- '- Codex CLI %s differs from managed Codex %s\n' "$CLI_VERSION" "$MANAGED_VERSION"
-  fi
-  if [ "$START_UNKNOWN_SOCKET" = "yes" ]; then
-    printf -- '- unknown process ownership prevents safe app-server cleanup\n'
-    [ -z "$START_SOCKET_OWNER_PIDS" ] || printf '  socket owner PID(s): %s\n' \
-      "$(printf '%s' "$START_SOCKET_OWNER_PIDS" | /usr/bin/tr '\n' ' ')"
-    [ -z "$SERVER_EXECUTABLE" ] || printf '  executable: %s\n' "$SERVER_EXECUTABLE"
-    [ -z "$SERVER_COMMAND" ] || printf '  command: %s\n' "$SERVER_COMMAND"
-    printf '  no process was terminated\n'
-  fi
-  if [ "$START_UNKNOWN_UPDATER" = "yes" ]; then
-    printf -- '- standalone updater state is %s and its process identity is not safe to assume\n' "$UPDATER_STATE"
-    [ -z "$UPDATER_PID" ] || printf '  updater PID: %s\n' "$UPDATER_PID"
-    printf '  no process was terminated\n'
-  fi
-
-  printf 'required action:\n'
-  START_ACTION_NUMBER=0
-  if { [ "$START_NEEDS_DESKTOP_INSTALL" = "yes" ] || \
-       [ "$START_NEEDS_DESKTOP_REINSTALL" = "yes" ]; } && ! brew_available; then
-    print_start_action "Install Homebrew from https://brew.sh"
-  fi
-  if [ "$START_NEEDS_DESKTOP_INSTALL" = "yes" ]; then
-    print_start_action "brew install --cask $PINNED_DESKTOP_CASK"
-  fi
-  if [ "$START_NEEDS_DESKTOP_REINSTALL" = "yes" ]; then
-    print_start_action "brew reinstall --cask $PINNED_DESKTOP_CASK"
-  fi
-  if [ "$START_NEEDS_CODEX_INSTALL" = "yes" ]; then
-    print_start_action "curl -fsSL $INSTALL_URL | sh"
-  fi
-  if [ "$START_NEEDS_CODEX_UPDATE" = "yes" ]; then
-    print_start_action "$PROGRAM_NAME update latest"
-  fi
-  if [ "$START_UNKNOWN_SOCKET" = "yes" ]; then
-    for process_id in $START_SOCKET_OWNER_PIDS; do
-      print_start_action "ps -p $process_id -o pid=,uid=,lstart=,command="
-    done
-    print_start_action "Close the application that owns the control socket"
-  fi
-  if [ "$START_UNKNOWN_UPDATER" = "yes" ]; then
-    [ -z "$UPDATER_PID" ] || print_start_action \
-      "ps -p $UPDATER_PID -o pid=,uid=,lstart=,command="
-    print_start_action "Close the unknown updater process or remove the conflicting PID record after inspection"
-  fi
-  if [ "$allow_unverified" = "yes" ]; then
-    print_start_action "$PROGRAM_NAME start --force"
+ensure_pinned_desktop() {
+  collect_state
+  [ "$DESKTOP_COMPATIBILITY" = "verified" ] && return 0
+  brew_available || fail "Homebrew is required to install the pinned ChatGPT Desktop"
+  if desktop_cask_installed; then
+    log "restoring pinned ChatGPT Desktop $SUPPORTED_DESKTOP_VERSION"
+    brew reinstall --cask "$PINNED_DESKTOP_CASK" || fail "failed to reinstall pinned ChatGPT Desktop"
   else
-    print_start_action "$PROGRAM_NAME start"
+    log "installing pinned ChatGPT Desktop $SUPPORTED_DESKTOP_VERSION"
+    brew install --cask --force "$PINNED_DESKTOP_CASK" || fail "failed to install pinned ChatGPT Desktop"
   fi
-  if [ "$START_NEEDS_DESKTOP_REINSTALL" = "yes" ]; then
-    printf 'alternative for temporary validation:\n  %s start --force\n' "$PROGRAM_NAME"
+  collect_state
+  [ "$DESKTOP_COMPATIBILITY" = "verified" ] || \
+    fail "pinned ChatGPT Desktop installation did not produce $SUPPORTED_DESKTOP_VERSION"
+}
+
+ensure_standalone_codex() {
+  collect_state
+  if [ -n "$CLI_VERSION" ] && [ -n "$MANAGED_VERSION" ] && \
+     [ "$CLI_VERSION" = "$MANAGED_VERSION" ]; then
+    return 0
   fi
-  return 1
+  target_version="$(latest_release_version)" || fail "failed to resolve the latest Codex release"
+  log "installing standalone Codex $target_version"
+  install_release "$target_version" || fail "official standalone Codex installer failed"
+  collect_state
+  [ "$MANAGED_VERSION" = "$target_version" ] || \
+    fail "managed Codex did not converge to $target_version"
+  [ "$CLI_VERSION" = "$target_version" ] || \
+    fail "Codex CLI did not converge to $target_version"
+}
+
+ensure_start_prerequisites() {
+  assert_safe_to_converge
+  collect_state
+  if [ "$DESKTOP_COMPATIBILITY" = "verified" ] && \
+     [ -n "$CLI_VERSION" ] && [ -n "$MANAGED_VERSION" ] && \
+     [ "$CLI_VERSION" = "$MANAGED_VERSION" ]; then
+    return 0
+  fi
+
+  log "repairing start prerequisites"
+  command_stop
+  ensure_pinned_desktop
+  ensure_standalone_codex
+  assert_safe_to_converge
 }
 
 command_start() {
-  allow_unverified=no
-  if [ "${1:-}" = "--force" ]; then allow_unverified=yes; shift; fi
-  [ "$#" -eq 0 ] || fail "start accepts only --force"
+  [ "$#" -eq 0 ] || fail "start does not accept arguments"
   require_macos
+  ensure_start_prerequisites
   ensure_desktop_auto_updates_disabled || return 1
-  start_preflight "$allow_unverified" || return 1
+  assert_safe_to_converge
 
   if [ "$OVERALL_STATE" = "healthy" ]; then
     log "$PROGRAM_NAME start: healthy"
@@ -942,43 +824,42 @@ command_start() {
   if [ "$needs_stop" = "yes" ]; then
     log "repairing shared daemon runtime before start"
     command_stop
-    # Quitting Desktop can apply a previously downloaded app update. Re-run all
-    # non-destructive blockers before enabling or reopening the possibly changed app.
-    start_preflight "$allow_unverified" || return 1
+    # Quitting Desktop can apply a staged update. Restore all deterministic
+    # prerequisites before reopening the app.
+    ensure_start_prerequisites
+    ensure_desktop_auto_updates_disabled || return 1
   fi
 
-  if [ "$allow_unverified" = "yes" ]; then
-    start_managed_reuse yes
-  else
-    start_managed_reuse no
-  fi
+  start_managed_reuse
   # ChatGPT may rewrite Sparkle preferences while launching. Enforce the pinned
   # policy again after attachment, then include it in final state verification.
   ensure_desktop_auto_updates_disabled || return 1
   collect_state
-  [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "start verification failed; run $PROGRAM_NAME status"
-  [ "$REUSE_ENABLED" = "yes" ] || fail "start verification failed; run $PROGRAM_NAME status"
-  [ "$DESKTOP_BACKEND" = "managed-daemon" ] || fail "start verification failed; run $PROGRAM_NAME status"
-  [ "$DESKTOP_AUTO_UPDATES" = "disabled" ] || fail "start verification failed; run $PROGRAM_NAME status"
+  [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "start verification found a non-managed daemon"
+  [ "$REUSE_ENABLED" = "yes" ] || fail "start verification found Desktop reuse disabled"
+  [ "$DESKTOP_BACKEND" = "managed-daemon" ] || fail "start verification found Desktop detached from the managed daemon"
+  [ "$DESKTOP_AUTO_UPDATES" = "disabled" ] || fail "start verification found Desktop automatic updates enabled"
   log "$PROGRAM_NAME start: healthy"
 }
 
 start_managed_reuse() {
-  allow_unverified="$1"
   require_macos
   [ -d "$CHATGPT_APP" ] || fail "ChatGPT is not installed at $CHATGPT_APP"
-  find_managed_codex || fail "official standalone Codex is required; install it from $INSTALL_URL"
+  find_managed_codex || fail "official standalone Codex is unavailable after prerequisite repair"
   collect_state
-  if [ "$DESKTOP_COMPATIBILITY" = "unverified" ] && [ "$allow_unverified" != "yes" ]; then
-    fail "Desktop $CHATGPT_VERSION is unverified; restore $SUPPORTED_DESKTOP_VERSION or run $PROGRAM_NAME start --force"
-  fi
+  [ "$DESKTOP_COMPATIBILITY" = "verified" ] || fail "ChatGPT Desktop is not the pinned version"
   if [ "$OVERALL_STATE" = "healthy" ]; then
     log "Desktop already uses the managed daemon"
     return
   fi
   case "$DAEMON_OWNERSHIP" in
-    unmanaged) fail "$DAEMON_OWNERSHIP app-server detected; run $PROGRAM_NAME stop, then $PROGRAM_NAME start" ;;
-    managed-unready) fail "managed daemon is not ready; run $PROGRAM_NAME stop, then $PROGRAM_NAME start" ;;
+    unmanaged) fail "runtime ownership changed to an unmanaged app-server during start" ;;
+    managed-unready) fail "managed daemon remained unready after automatic cleanup" ;;
+  esac
+  log "enabling managed daemon remote control"
+  "$MANAGED_CODEX_BIN" app-server daemon enable-remote-control || \
+    fail "failed to enable managed daemon remote control"
+  case "$DAEMON_OWNERSHIP" in
     stopped|stale-socket)
       log "starting the managed daemon"
       "$MANAGED_CODEX_BIN" app-server daemon start || fail "failed to start the managed daemon"
@@ -993,19 +874,26 @@ start_managed_reuse() {
       ;;
   esac
   collect_state
-  [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "daemon is not managed; run $PROGRAM_NAME stop, then $PROGRAM_NAME start"
+  [ "$DAEMON_OWNERSHIP" = "managed" ] || fail "managed daemon did not own the control socket after start"
   [ -z "$MANAGED_VERSION" ] || [ "$MANAGED_VERSION" = "$RUNNING_VERSION" ] || fail "daemon version mismatch"
   was_running="no"
   [ -n "$CHATGPT_PIDS" ] && was_running="yes"
   enable_reuse
   if [ "$was_running" = "yes" ]; then
-    if ! stop_chatgpt no; then
+    if ! stop_chatgpt yes; then
       disable_reuse
-      fail "ChatGPT did not exit cleanly; close it and rerun $PROGRAM_NAME start"
+      fail "ChatGPT did not exit during automatic reattachment"
     fi
   fi
   open_chatgpt || fail "failed to open ChatGPT"
-  wait_for_desktop_attach || fail "ChatGPT did not connect to the managed daemon; run $PROGRAM_NAME status"
+  if ! wait_for_desktop_attach; then
+    log "Desktop did not attach; retrying the managed runtime once"
+    stop_chatgpt yes || fail "ChatGPT did not exit for the bounded attachment retry"
+    "$MANAGED_CODEX_BIN" app-server daemon restart || fail "failed to restart the managed daemon for attachment retry"
+    enable_reuse
+    open_chatgpt || fail "failed to reopen ChatGPT for attachment retry"
+    wait_for_desktop_attach || fail "ChatGPT did not connect to the managed daemon after bounded retry"
+  fi
   log "Desktop daemon reuse is enabled"
 }
 
@@ -1083,19 +971,14 @@ command_stop() {
 }
 
 command_restart() {
-  allow_unverified=no
-  if [ "${1:-}" = "--force" ]; then allow_unverified=yes; shift; fi
-  [ "$#" -eq 0 ] || fail "restart accepts only --force"
+  [ "$#" -eq 0 ] || fail "restart does not accept arguments"
 
-  # Preflight before interrupting a healthy session. Installation, compatibility,
-  # or unknown-process blockers must be resolved before restart tears anything down.
-  start_preflight "$allow_unverified" || return 1
+  # Unknown ownership must be rejected before interrupting a healthy session.
+  # A stopped runtime is valid: command_stop is idempotent and restart then
+  # converges through the same closed-loop start path.
+  assert_safe_to_converge
   command_stop
-  if [ "$allow_unverified" = "yes" ]; then
-    command_start --force
-  else
-    command_start
-  fi
+  command_start
 }
 
 latest_release_version() {
@@ -1148,45 +1031,27 @@ command_update() {
   require_macos
   if [ "$target" = "check" ]; then print_update_check; return; fi
   valid_release "$target" || fail "invalid Codex release: $target"
-  find_managed_codex || fail "official standalone Codex is required; install it from $INSTALL_URL"
+  assert_safe_to_converge
   collect_state
-  case "$DAEMON_OWNERSHIP" in
-    unmanaged) fail "$DAEMON_OWNERSHIP app-server detected; run $PROGRAM_NAME stop first" ;;
-    managed-unready) fail "managed daemon is not ready; run $PROGRAM_NAME stop first" ;;
-  esac
   expected_version="$target"
   if [ "$target" = "latest" ]; then expected_version="$(latest_release_version)" || fail "failed to resolve latest release"; fi
-  daemon_was_running="no"
-  [ "$DAEMON_OWNERSHIP" = "managed" ] && daemon_was_running="yes"
-  desktop_was_running="no"
-  [ -n "$CHATGPT_PIDS" ] && desktop_was_running="yes"
-  reuse_was_enabled="$REUSE_ENABLED"
+  runtime_was_active="no"
+  if [ "$DAEMON_OWNERSHIP" != "stopped" ] || [ -n "$CHATGPT_PIDS" ] || [ "$REUSE_ENABLED" = "yes" ]; then
+    runtime_was_active="yes"
+  fi
 
-  stop_updater
-  remove_stale_pid_file "$UPDATER_PID_FILE" || fail "updater PID record changed during update"
+  command_stop
   log "installing standalone Codex $expected_version"
   install_release "$expected_version" || fail "official standalone installer failed"
   find_managed_codex || fail "managed Codex is unavailable after installation"
   installed_version="$(codex_version "$MANAGED_CODEX_BIN" || true)"
   [ "$installed_version" = "$expected_version" ] || fail "installer selected $installed_version instead of $expected_version"
 
-  if [ "$daemon_was_running" = "yes" ]; then
-    if [ "$desktop_was_running" = "yes" ] && [ "$reuse_was_enabled" = "yes" ]; then
-      stop_chatgpt no || fail "Codex updated, but ChatGPT did not exit cleanly"
-    fi
-    log "restarting the managed daemon with Codex $installed_version"
-    if ! "$MANAGED_CODEX_BIN" app-server daemon restart; then
-      if [ "$desktop_was_running" = "yes" ] && [ "$reuse_was_enabled" = "yes" ]; then
-        open_chatgpt >/dev/null 2>&1 || true
-      fi
-      fail "Codex updated, but daemon restart failed"
-    fi
-    if [ "$desktop_was_running" = "yes" ] && [ "$reuse_was_enabled" = "yes" ]; then
-      open_chatgpt || fail "Codex updated, but ChatGPT could not be reopened"
-    fi
+  if [ "$runtime_was_active" = "yes" ]; then
+    command_start
   fi
   collect_state
-  if [ "$daemon_was_running" = "yes" ]; then
+  if [ "$runtime_was_active" = "yes" ]; then
     [ "$DAEMON_OWNERSHIP" = "managed" ] && [ "$RUNNING_VERSION" = "$installed_version" ] || \
       fail "update installed, but daemon did not converge to $installed_version"
   fi

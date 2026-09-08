@@ -140,7 +140,7 @@ assert_classification managed no 42 not-managed-daemon verified 0.153.4 0.153.4 
 assert_classification stopped yes "" inactive verified 0.153.4 "" stopped
 assert_classification managed yes 42 managed-daemon unverified 0.153.4 0.153.4 unsupported-desktop
 
-# status must report every independent problem and compose an ordered recovery plan.
+# status reports every independent problem without asking the user to compose a plan.
 combined_status_output="$( (
   CHATGPT_APP=/Applications/ChatGPT.app
   CHATGPT_VERSION=26.901.51231
@@ -153,17 +153,15 @@ combined_status_output="$( (
   REUSE_ENABLED=no
   CHATGPT_PIDS=""
   DESKTOP_BACKEND=inactive
-  print_issues_and_recovery
+  print_issues
 ) )"
 printf '%s\n' "$combined_status_output" | grep -F "ChatGPT Desktop 26.901.51231 is unverified" >/dev/null
 printf '%s\n' "$combined_status_output" | grep -F "an unmanaged app-server owns the control socket" >/dev/null
 printf '%s\n' "$combined_status_output" | grep -F "Desktop daemon reuse is disabled" >/dev/null
 printf '%s\n' "$combined_status_output" | grep -F "ChatGPT Desktop is not running" >/dev/null
-printf '%s\n' "$combined_status_output" | grep -F "1. brew reinstall --cask omzcj/omzcj/chatgpt" >/dev/null
-printf '%s\n' "$combined_status_output" | grep -F "2. codex-remote start" >/dev/null
-printf '%s\n' "$combined_status_output" | grep -F "3. codex-remote status" >/dev/null
+if printf '%s\n' "$combined_status_output" | grep -F "recommended recovery" >/dev/null; then exit 1; fi
 
-# A missing Desktop uses install, not reinstall, before the smart start entrypoint.
+# A missing Desktop is reported as a fact without a recovery menu.
 missing_desktop_output="$( (
   CHATGPT_APP=/Applications/ChatGPT.app
   DESKTOP_COMPATIBILITY=missing
@@ -175,10 +173,10 @@ missing_desktop_output="$( (
   REUSE_ENABLED=yes
   CHATGPT_PIDS=""
   DESKTOP_BACKEND=inactive
-  print_issues_and_recovery
+  print_issues
 ) )"
-printf '%s\n' "$missing_desktop_output" | grep -F "1. brew install --cask omzcj/omzcj/chatgpt" >/dev/null
-if printf '%s\n' "$missing_desktop_output" | grep -F "brew reinstall" >/dev/null; then exit 1; fi
+printf '%s\n' "$missing_desktop_output" | grep -F "ChatGPT Desktop is not installed" >/dev/null
+if printf '%s\n' "$missing_desktop_output" | grep -F "brew install" >/dev/null; then exit 1; fi
 
 # A healthy state must not invent recovery work.
 healthy_status_output="$( (
@@ -192,12 +190,11 @@ healthy_status_output="$( (
   REUSE_ENABLED=yes
   CHATGPT_PIDS=42
   DESKTOP_BACKEND=managed-daemon
-  print_issues_and_recovery
+  print_issues
 ) )"
 printf '%s\n' "$healthy_status_output" | grep -F -- "- none" >/dev/null
-printf '%s\n' "$healthy_status_output" | grep -F "recommended recovery: none" >/dev/null
 
-# status reports update preferences and directs repair through start.
+# status reports update preferences without directing repair.
 auto_update_status_output="$( (
   DESKTOP_COMPATIBILITY=verified
   DESKTOP_AUTO_UPDATES=not-disabled
@@ -209,10 +206,9 @@ auto_update_status_output="$( (
   REUSE_ENABLED=yes
   CHATGPT_PIDS=42
   DESKTOP_BACKEND=managed-daemon
-  print_issues_and_recovery
+  print_issues
 ) )"
 printf '%s\n' "$auto_update_status_output" | grep -F "ChatGPT Desktop automatic updates are not disabled" >/dev/null
-printf '%s\n' "$auto_update_status_output" | grep -F "1. codex-remote start" >/dev/null
 
 # The internal attach stage must refuse an unmanaged app-server instead of guessing.
 set +e
@@ -224,12 +220,12 @@ attach_error="$( (
     DAEMON_OWNERSHIP=unmanaged
   }
   CHATGPT_APP=/tmp
-  start_managed_reuse no
+  start_managed_reuse
 ) 2>&1)"
 attach_status=$?
 set -e
 [ "$attach_status" -ne 0 ]
-printf '%s\n' "$attach_error" | grep -F "run codex-remote stop, then codex-remote start" >/dev/null
+printf '%s\n' "$attach_error" | grep -F "runtime ownership changed" >/dev/null
 
 # A successful daemon start is insufficient if the follow-up probe has no pid backend.
 set +e
@@ -244,12 +240,12 @@ missing_backend_error="$( (
     if [ "$collect_count" -eq 1 ]; then DAEMON_OWNERSHIP=stopped; else DAEMON_OWNERSHIP=unmanaged; fi
   }
   CHATGPT_APP=/tmp
-  start_managed_reuse no
+  start_managed_reuse
 ) 2>&1)"
 missing_backend_status=$?
 set -e
 [ "$missing_backend_status" -ne 0 ]
-printf '%s\n' "$missing_backend_error" | grep -F "daemon is not managed" >/dev/null
+printf '%s\n' "$missing_backend_error" | grep -F "did not own the control socket" >/dev/null
 
 # A healthy internal attach is idempotent and must not restart either process.
 (
@@ -263,13 +259,14 @@ printf '%s\n' "$missing_backend_error" | grep -F "daemon is not managed" >/dev/n
   enable_reuse() { exit 1; }
   stop_chatgpt() { exit 1; }
   CHATGPT_APP=/tmp
-  start_managed_reuse no
+  start_managed_reuse
 )
 
-# A failed preference write blocks start and prints both manual recovery commands.
+# A failed preference write blocks start with one concrete reason.
 set +e
 auto_update_error="$( (
   require_macos() { :; }
+  ensure_start_prerequisites() { :; }
   disable_desktop_auto_updates() { return 1; }
   CHATGPT_APP=/tmp
   command_start
@@ -278,8 +275,6 @@ auto_update_status=$?
 set -e
 [ "$auto_update_status" -ne 0 ]
 printf '%s\n' "$auto_update_error" | grep -F "failed to disable ChatGPT Desktop automatic updates" >/dev/null
-printf '%s\n' "$auto_update_error" | grep -F "defaults write com.openai.codex SUEnableAutomaticChecks -bool false" >/dev/null
-printf '%s\n' "$auto_update_error" | grep -F "defaults write com.openai.codex SUAutomaticallyUpdate -bool false" >/dev/null
 
 # A healthy start does not stop or reattach the managed runtime.
 (
@@ -330,69 +325,42 @@ printf '%s\n' "$auto_update_error" | grep -F "defaults write com.openai.codex SU
   [ "$order" = "stop attach " ]
 )
 
-# Quitting Desktop can apply a staged update, so start must preflight again after stop.
-set +e
-post_reset_update_output="$( (
+# A non-pinned Desktop is restored automatically through the pinned cask.
+(
   collect_count=0
   require_macos() { :; }
   brew_available() { return 0; }
+  desktop_cask_installed() { return 0; }
+  brew() { [ "$*" = "reinstall --cask omzcj/omzcj/chatgpt" ]; }
   collect_state() {
     collect_count=$((collect_count + 1))
-    MANAGED_VERSION=0.153.4
-    CLI_VERSION=0.153.4
-    UPDATER_STATE=stopped
     if [ "$collect_count" -eq 1 ]; then
-      CHATGPT_VERSION=26.818.61809
-      DESKTOP_COMPATIBILITY=verified
-      DAEMON_OWNERSHIP=unmanaged
-      SERVER_PID=42
-      OVERALL_STATE=unmanaged
-    else
-      CHATGPT_VERSION=26.901.51231
       DESKTOP_COMPATIBILITY=unverified
-      DAEMON_OWNERSHIP=stopped
-      SERVER_PID=""
-      OVERALL_STATE=stopped
+    else
+      DESKTOP_COMPATIBILITY=verified
     fi
   }
-  socket_owner_pids() { printf '42\n'; }
-  process_start_time() { printf 'Sat Sep  6 12:00:00 2026\n'; }
-  is_safe_app_server_pid() { return 0; }
-  command_stop() { :; }
-  start_managed_reuse() { exit 99; }
-  command_start
-) 2>&1)"
-post_reset_update_status=$?
-set -e
-[ "$post_reset_update_status" -eq 1 ]
-printf '%s\n' "$post_reset_update_output" | grep -F "ChatGPT Desktop 26.901.51231 is unverified" >/dev/null
-printf '%s\n' "$post_reset_update_output" | grep -F "brew reinstall --cask omzcj/omzcj/chatgpt" >/dev/null
+  ensure_pinned_desktop
+)
 
-# Installation and compatibility blockers are aggregated with copyable actions.
-set +e
-start_blocked_output="$( (
+# Missing or skewed standalone Codex installs converge to the resolved release.
+(
+  collect_count=0
   require_macos() { :; }
-  brew_available() { return 0; }
   collect_state() {
-    CHATGPT_VERSION=26.901.51231
-    DESKTOP_COMPATIBILITY=unverified
-    MANAGED_VERSION=""
-    CLI_VERSION=""
-    DAEMON_OWNERSHIP=stopped
-    UPDATER_STATE=stopped
+    collect_count=$((collect_count + 1))
+    if [ "$collect_count" -eq 1 ]; then
+      CLI_VERSION=""
+      MANAGED_VERSION=""
+    else
+      CLI_VERSION=0.153.4
+      MANAGED_VERSION=0.153.4
+    fi
   }
-  command_start
-) 2>&1)"
-start_blocked_status=$?
-set -e
-[ "$start_blocked_status" -ne 0 ]
-printf '%s\n' "$start_blocked_output" | grep -F "codex-remote start: blocked" >/dev/null
-printf '%s\n' "$start_blocked_output" | grep -F "ChatGPT Desktop 26.901.51231 is unverified" >/dev/null
-printf '%s\n' "$start_blocked_output" | grep -F "official standalone managed Codex is not installed" >/dev/null
-printf '%s\n' "$start_blocked_output" | grep -F "1. brew reinstall --cask omzcj/omzcj/chatgpt" >/dev/null
-printf '%s\n' "$start_blocked_output" | grep -F "2. curl -fsSL https://chatgpt.com/codex/install.sh | sh" >/dev/null
-printf '%s\n' "$start_blocked_output" | grep -F "3. codex-remote start" >/dev/null
-printf '%s\n' "$start_blocked_output" | grep -F "codex-remote start --force" >/dev/null
+  latest_release_version() { printf '0.153.4\n'; }
+  install_release() { [ "$1" = "0.153.4" ]; }
+  ensure_standalone_codex
+)
 
 # Missing Homebrew is called out before the pinned Desktop install command.
 set +e
@@ -411,28 +379,7 @@ missing_brew_output="$( (
 missing_brew_status=$?
 set -e
 [ "$missing_brew_status" -ne 0 ]
-printf '%s\n' "$missing_brew_output" | grep -F "1. Install Homebrew from https://brew.sh" >/dev/null
-printf '%s\n' "$missing_brew_output" | grep -F "2. brew install --cask omzcj/omzcj/chatgpt" >/dev/null
-
-# CLI/managed version skew is never upgraded implicitly.
-set +e
-version_skew_output="$( (
-  require_macos() { :; }
-  collect_state() {
-    DESKTOP_COMPATIBILITY=verified
-    MANAGED_VERSION=0.153.4
-    CLI_VERSION=0.154.0
-    DAEMON_OWNERSHIP=managed
-    UPDATER_STATE=stopped
-  }
-  command_start
-) 2>&1)"
-version_skew_status=$?
-set -e
-[ "$version_skew_status" -ne 0 ]
-printf '%s\n' "$version_skew_output" | grep -F "Codex CLI 0.154.0 differs from managed Codex 0.153.4" >/dev/null
-printf '%s\n' "$version_skew_output" | grep -F "1. codex-remote update latest" >/dev/null
-printf '%s\n' "$version_skew_output" | grep -F "2. codex-remote start" >/dev/null
+printf '%s\n' "$missing_brew_output" | grep -F "Homebrew is required to install the pinned ChatGPT Desktop" >/dev/null
 
 # Unknown socket ownership is diagnostic-only; start must not terminate it.
 set +e
@@ -457,10 +404,7 @@ unknown_owner_output="$( (
 unknown_owner_status=$?
 set -e
 [ "$unknown_owner_status" -ne 0 ]
-printf '%s\n' "$unknown_owner_output" | grep -F "unknown process ownership prevents safe app-server cleanup" >/dev/null
-printf '%s\n' "$unknown_owner_output" | grep -F "executable: /tmp/unrelated/codex" >/dev/null
-printf '%s\n' "$unknown_owner_output" | grep -F "ps -p 42 -o pid=,uid=,lstart=,command=" >/dev/null
-printf '%s\n' "$unknown_owner_output" | grep -F "no process was terminated" >/dev/null
+printf '%s\n' "$unknown_owner_output" | grep -F "cannot safely replace control-socket owner PID(s): 42" >/dev/null
 
 # Ambiguous updater ownership is also diagnostic-only.
 set +e
@@ -480,40 +424,29 @@ unknown_updater_output="$( (
 unknown_updater_status=$?
 set -e
 [ "$unknown_updater_status" -ne 0 ]
-printf '%s\n' "$unknown_updater_output" | grep -F "standalone updater state is ambiguous" >/dev/null
-printf '%s\n' "$unknown_updater_output" | grep -F "ps -p 73 -o pid=,uid=,lstart=,command=" >/dev/null
-printf '%s\n' "$unknown_updater_output" | grep -F "no process was terminated" >/dev/null
+printf '%s\n' "$unknown_updater_output" | grep -F "cannot safely replace standalone updater state: ambiguous" >/dev/null
 
-# restart preflights first, then deliberately performs a full stop/start cycle.
+# restart checks safety first, then performs ensure-stopped and closed-loop start.
 (
   order=""
-  start_preflight() { order="${order}preflight "; }
+  assert_safe_to_converge() { order="${order}safety "; }
   command_stop() { order="${order}stop "; }
   command_start() { order="${order}start:$* "; }
-  command_restart --force
-  [ "$order" = "preflight stop start:--force " ]
+  command_restart
+  [ "$order" = "safety stop start: " ]
 )
 
-# A restart blocker is reported before anything is stopped.
+# A hard restart blocker is reported before anything is stopped.
 set +e
 restart_blocked_output="$( (
-  require_macos() { :; }
-  brew_available() { return 0; }
-  collect_state() {
-    CHATGPT_VERSION=26.901.51231
-    DESKTOP_COMPATIBILITY=unverified
-    MANAGED_VERSION=0.153.4
-    CLI_VERSION=0.153.4
-    DAEMON_OWNERSHIP=managed
-    UPDATER_STATE=stopped
-  }
+  assert_safe_to_converge() { fail "cannot safely replace control-socket owner PID(s): 42"; }
   command_stop() { exit 99; }
   command_restart
 ) 2>&1)"
 restart_blocked_status=$?
 set -e
 [ "$restart_blocked_status" -eq 1 ]
-printf '%s\n' "$restart_blocked_output" | grep -F "codex-remote start: blocked" >/dev/null
+printf '%s\n' "$restart_blocked_output" | grep -F "cannot safely replace control-socket owner PID(s): 42" >/dev/null
 
 # The internal attach stage must open and verify Desktop when it was initially stopped.
 (
@@ -532,27 +465,35 @@ printf '%s\n' "$restart_blocked_output" | grep -F "codex-remote start: blocked" 
   open_chatgpt() { order="${order}open "; }
   wait_for_desktop_attach() { order="${order}verify "; }
   CHATGPT_APP=/tmp
-  start_managed_reuse no
+  start_managed_reuse
   [ "$order" = "reuse open verify " ]
 )
 
-# update must apply the same unmanaged guard before invoking the installer.
-set +e
-update_error="$( (
+# update closes and restores an active runtime without asking for a stop command.
+(
+  order=""
   require_macos() { :; }
   valid_release() { return 0; }
-  find_managed_codex() { MANAGED_CODEX_BIN=/usr/bin/true; return 0; }
-  collect_state() { DAEMON_OWNERSHIP=unmanaged; }
+  assert_safe_to_converge() { :; }
+  collect_state() {
+    DAEMON_OWNERSHIP=managed
+    CHATGPT_PIDS=42
+    REUSE_ENABLED=yes
+    RUNNING_VERSION=0.153.4
+  }
+  command_stop() { order="${order}stop "; }
+  install_release() { order="${order}install:$1 "; }
+  find_managed_codex() { MANAGED_CODEX_BIN=/bin/true; return 0; }
+  codex_version() { printf '0.153.4\n'; }
+  command_start() { order="${order}start "; }
   command_update 0.153.4
-) 2>&1)"
-update_status=$?
-set -e
-[ "$update_status" -ne 0 ]
-printf '%s\n' "$update_error" | grep -F "run codex-remote stop first" >/dev/null
+  [ "$order" = "stop install:0.153.4 start " ]
+)
 
 # latest is resolved once and the installer receives the exact version.
 (
   require_macos() { :; }
+  assert_safe_to_converge() { :; }
   find_managed_codex() { MANAGED_CODEX_BIN=/bin/true; return 0; }
   collect_state() {
     DAEMON_OWNERSHIP=stopped
@@ -560,8 +501,7 @@ printf '%s\n' "$update_error" | grep -F "run codex-remote stop first" >/dev/null
     REUSE_ENABLED=no
   }
   latest_release_version() { printf '0.153.4\n'; }
-  stop_updater() { :; }
-  remove_stale_pid_file() { :; }
+  command_stop() { :; }
   install_release() { [ "$1" = "0.153.4" ]; }
   codex_version() { printf '0.153.4\n'; }
   command_update latest
@@ -656,14 +596,14 @@ printf '%s\n' "$update_error" | grep -F "run codex-remote stop first" >/dev/null
 # A stale socket has no live process and must not block a standalone-only update.
 (
   require_macos() { :; }
+  assert_safe_to_converge() { :; }
   find_managed_codex() { MANAGED_CODEX_BIN=/usr/bin/true; return 0; }
   collect_state() {
     DAEMON_OWNERSHIP=stale-socket
     CHATGPT_PIDS=""
     REUSE_ENABLED=no
   }
-  stop_updater() { :; }
-  remove_stale_pid_file() { :; }
+  command_stop() { :; }
   install_release() { [ "$1" = "0.153.4" ]; }
   codex_version() { printf '0.153.4\n'; }
   command_update 0.153.4
