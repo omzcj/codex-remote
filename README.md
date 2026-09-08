@@ -77,6 +77,9 @@ managed Codex 错位时，`start` 会通过官方安装器统一到当前 latest
 关闭，避免它在后续 `start` 前抢占 control socket。
 它只终止占用当前 `CODEX_HOME` control socket 的精确 app-server PID 和经过校验的 updater
 PID，不会使用 `pkill codex`，也不会删除配置、认证、线程、日志或 standalone releases。
+如果官方 `daemon stop` 拒绝一个已经由 socket、可执行文件、UID、启动时间和命令行
+共同确认的 managed 进程，`stop` 会使用同一套身份校验安全终止该 PID，避免生命周期元数据
+错位使闭环永久卡住；任何身份不明确的进程仍会原样保留并报告 blocker。
 
 `update` 只更新 standalone Codex/app-server，不更新 ChatGPT.app。它会自动收敛可安全识别
 的 managed 或 unmanaged runtime，更新后恢复之前处于活动状态的 daemon 和 Desktop；原本

@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.08.3"
+PROGRAM_VERSION="2026.09.08.4"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 SPARKLE_ENV_NAME="CODEX_SPARKLE_ENABLED"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
@@ -1066,9 +1066,24 @@ command_stop() {
       [ -n "$MANAGED_CODEX_BIN" ] || fail "managed Codex binary is unavailable"
       log "stopping the managed daemon"
       if ! stop_output="$("$MANAGED_CODEX_BIN" app-server daemon stop 2>&1)"; then
-        [ "$was_running" = "yes" ] && open_chatgpt >/dev/null 2>&1 || true
         printf '%s\n' "$stop_output" >&2
-        fail "official daemon stop failed; no manual fallback was attempted"
+        collect_state
+        if [ -z "$SERVER_PID" ] || \
+           { [ "$DAEMON_OWNERSHIP" != "managed" ] && [ "$DAEMON_OWNERSHIP" != "managed-unready" ]; }; then
+          if [ "$was_running" = "yes" ]; then
+            enable_reuse
+            open_chatgpt >/dev/null 2>&1 || true
+          fi
+          fail "official daemon stop failed and the remaining process could not be identified safely"
+        fi
+        log "official daemon lifecycle rejected its process; using verified PID fallback"
+        if ! terminate_app_server "$SERVER_PID"; then
+          if [ "$was_running" = "yes" ]; then
+            enable_reuse
+            open_chatgpt >/dev/null 2>&1 || true
+          fi
+          fail "official daemon stop failed and the verified PID fallback did not complete"
+        fi
       fi
       collect_state
       ;;
