@@ -51,6 +51,8 @@ reuse 环境变量始终读写登录用户的 `gui/<uid>` launchd bootstrap doma
 runtime、残留 updater 或 unready daemon。它会显式启用 Remote Control，启动 managed
 daemon，打开 ChatGPT 并等待 Desktop 真正接入。首次接入失败时会自动执行一次有上限的
 daemon/Desktop 重试，最终只返回成功或一个无法安全自动处理的 blocker。
+运行中的 daemon 如果已经由 control socket、官方可执行文件和 `--remote-control` 参数
+确认处于 managed 模式，`start` 会直接复用，不再要求生命周期命令重复 enable。
 
 每次 `start` 都会在登录用户的 GUI launchd 环境中设置
 `CODEX_SPARKLE_ENABLED=false`。这是固定版 Desktop 在创建 updater 前读取的启动门控；

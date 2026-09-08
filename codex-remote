@@ -3,7 +3,7 @@
 set -u
 
 PROGRAM_NAME="codex-remote"
-PROGRAM_VERSION="2026.09.08.4"
+PROGRAM_VERSION="2026.09.08.5"
 ENV_NAME="CODEX_APP_SERVER_USE_LOCAL_DAEMON"
 SPARKLE_ENV_NAME="CODEX_SPARKLE_ENABLED"
 INSTALL_URL="https://chatgpt.com/codex/install.sh"
@@ -972,9 +972,13 @@ start_managed_reuse() {
     unmanaged) fail "runtime ownership changed to an unmanaged app-server during start" ;;
     managed-unready) fail "managed daemon remained unready after automatic cleanup" ;;
   esac
-  log "enabling managed daemon remote control"
-  "$MANAGED_CODEX_BIN" app-server daemon enable-remote-control || \
-    fail "failed to enable managed daemon remote control"
+  if [ "$DAEMON_OWNERSHIP" = "managed" ]; then
+    log "managed daemon remote control is already active"
+  else
+    log "enabling managed daemon remote control"
+    "$MANAGED_CODEX_BIN" app-server daemon enable-remote-control || \
+      fail "failed to enable managed daemon remote control"
+  fi
   case "$DAEMON_OWNERSHIP" in
     stopped|stale-socket)
       log "starting the managed daemon"
